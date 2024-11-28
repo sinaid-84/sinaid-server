@@ -49,6 +49,13 @@
         .row-disconnected {
             background-color: #fbeeee; /* 연한 빨간색 배경 */
         }
+        /* 목표 달성 메시지 스타일 */
+        .goal-message {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 1000;
+        }
     </style>
 </head>
 <body>
@@ -65,10 +72,13 @@
                     <th>현재 수익율 (%)</th>
                     <th>미실현 손익 (USDT)</th>
                     <th>총 자산 (미실현 손익 포함) (USDT)</th>
+                    <th>누적 수익금 (USDT)</th>
+                    <th>목표 수익금 (USDT)</th>
                     <th>서버 통신 상태</th>
                     <th>타임스탬프</th>
                     <th>승인</th>
                     <th>승인취소</th>
+                    <th>목표 달성</th>
                 </tr>
             </thead>
             <tbody id="data-body">
@@ -76,6 +86,9 @@
             </tbody>
         </table>
     </div>
+
+    <!-- 목표 달성 메시지 영역 -->
+    <div id="goal-message-container" class="goal-message"></div>
 
     <!-- Bootstrap JS 로드 -->
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js" integrity="sha384-ROAPyY4h6a9kAqV6iEOJq9k6lZPqqvIy3s6eGZKlj/DuCkC8rjCGY3bEhVB0jRiS" crossorigin="anonymous"></script>
@@ -110,8 +123,26 @@
                 clientData[data.name].isApproved = false;
             }
 
+            // 초기 누적 수익금과 목표 수익금 설정 (if not present)
+            if (clientData[data.name].cumulative_profit === undefined) {
+                clientData[data.name].cumulative_profit = 0;
+            }
+            if (clientData[data.name].target_profit === undefined) {
+                clientData[data.name].target_profit = 500; // 기본값 500
+            }
+
             // 테이블 업데이트
             updateTable();
+        });
+
+        // 서버로부터 목표 수익금 업데이트 수신
+        socket.on('update_target_profit', (data) => {
+            const { name, targetProfit } = data;
+            if (clientData[name]) {
+                clientData[name].target_profit = targetProfit;
+                console.log(`목표 수익금 업데이트: ${name} - ${targetProfit} USDT`);
+                updateTable();
+            }
         });
 
         // 서버로부터 데이터 수신 시
@@ -140,9 +171,31 @@
             updateTable();
         });
 
-        // 서버와의 연결이 끊겼을 때
-        socket.on('disconnect', () => {
-            console.log('서버와의 연결이 끊어졌습니다.');
+        // 서버로부터 승인 상태 업데이트 수신
+        socket.on('update_approval_status', (data) => {
+            console.log('승인 상태 업데이트:', data);
+            if (clientData[data.name]) {
+                clientData[data.name].isApproved = data.isApproved;
+                updateTable();
+            }
+        });
+
+        // 서버로부터 목표 달성 이벤트 수신
+        socket.on('goal_achieved', (data) => {
+            const { name } = data;
+            console.log(`목표 달성 이벤트 수신: ${name}`);
+
+            // 승인취소 명령 전송
+            sendCommand('cancel_approve', name);
+
+            // 목표 달성 메시지 표시
+            showGoalAchievedMessage(name);
+        });
+
+        // 서버로부터 목표 달성 메시지 수신
+        socket.on('show_goal_message', (data) => {
+            const { name, message } = data;
+            showGoalAchievedMessage(name, message);
         });
 
         // 테이블 업데이트 함수
@@ -161,30 +214,64 @@
                     row.classList.add('row-disconnected');
                 }
 
+                // 이름
                 const nameCell = document.createElement('td');
                 nameCell.textContent = data.name || '';
                 row.appendChild(nameCell);
 
+                // 사용자 IP 주소
                 const ipCell = document.createElement('td');
                 ipCell.textContent = data.user_ip || '';
                 row.appendChild(ipCell);
 
+                // 총 자산 (USDT)
                 const totalBalanceCell = document.createElement('td');
                 totalBalanceCell.textContent = data.total_balance != null ? parseFloat(data.total_balance).toLocaleString() : '';
                 row.appendChild(totalBalanceCell);
 
+                // 현재 수익율 (%)
                 const profitRateCell = document.createElement('td');
                 profitRateCell.textContent = data.current_profit_rate != null ? parseFloat(data.current_profit_rate).toFixed(2) + '%' : '';
                 row.appendChild(profitRateCell);
 
+                // 미실현 손익 (USDT)
                 const unrealizedPnlCell = document.createElement('td');
                 unrealizedPnlCell.textContent = data.unrealized_pnl != null ? parseFloat(data.unrealized_pnl).toLocaleString() : '';
                 row.appendChild(unrealizedPnlCell);
 
+                // 총 자산 (미실현 손익 포함) (USDT)
                 const totalWithPnlCell = document.createElement('td');
                 totalWithPnlCell.textContent = data.current_total_asset != null ? parseFloat(data.current_total_asset).toLocaleString() : '';
                 row.appendChild(totalWithPnlCell);
 
+                // 누적 수익금 (USDT)
+                const cumulativeProfitCell = document.createElement('td');
+                cumulativeProfitCell.textContent = data.cumulative_profit != null ? parseFloat(data.cumulative_profit).toLocaleString() : '';
+                row.appendChild(cumulativeProfitCell);
+
+                // 목표 수익금 (USDT) 및 설정 기능 추가
+                const targetProfitCell = document.createElement('td');
+                // 목표 수익금 표시 및 설정 기능 추가
+                const targetProfitInput = document.createElement('input');
+                targetProfitInput.type = 'number';
+                targetProfitInput.min = '0';
+                targetProfitInput.step = '0.01';
+                targetProfitInput.value = data.target_profit != null ? parseFloat(data.target_profit).toFixed(2) : '500';
+                targetProfitInput.classList.add('form-control', 'form-control-sm');
+                targetProfitInput.style.width = '100px';
+                targetProfitInput.id = `target-profit-${data.name}`;
+                targetProfitCell.appendChild(targetProfitInput);
+
+                // Set 버튼 추가
+                const setButton = document.createElement('button');
+                setButton.textContent = 'Set';
+                setButton.classList.add('btn', 'btn-primary', 'btn-sm', 'mt-1');
+                setButton.onclick = () => setTargetProfit(data.name);
+                targetProfitCell.appendChild(setButton);
+
+                row.appendChild(targetProfitCell);
+
+                // 서버 통신 상태
                 const serverStatusCell = document.createElement('td');
                 serverStatusCell.textContent = data.server_status || '';
                 if (data.server_status === 'Connected') {
@@ -194,6 +281,7 @@
                 }
                 row.appendChild(serverStatusCell);
 
+                // 타임스탬프
                 const timestampCell = document.createElement('td');
                 timestampCell.textContent = data.timestamp || '';
                 row.appendChild(timestampCell);
@@ -217,25 +305,101 @@
                 cancelApproveButton.onclick = () => sendCommand('cancel_approve', data.name);
                 // 승인 상태에 따라 버튼 활성화/비활성화
                 cancelApproveButton.disabled = !data.isApproved;
+                cancelApproveButton.id = `cancel-approve-${data.name}`; // 버튼 식별을 위한 ID 설정
                 cancelApproveCell.appendChild(cancelApproveButton);
                 row.appendChild(cancelApproveCell);
 
+                // 목표 달성 열 추가
+                const goalAchievedCell = document.createElement('td');
+                if (data.cumulative_profit >= data.target_profit) {
+                    goalAchievedCell.textContent = '목표를 달성했습니다';
+                    goalAchievedCell.classList.add('text-success', 'fw-bold');
+                } else {
+                    goalAchievedCell.textContent = '';
+                }
+                row.appendChild(goalAchievedCell);
+
                 tbody.appendChild(row);
+
+                // 목표 수익금 달성 시 자동 승인취소 명령 전송
+                if (data.cumulative_profit >= data.target_profit && data.isApproved) {
+                    // 승인취소 버튼을 찾아 클릭
+                    const cancelButton = document.getElementById(`cancel-approve-${data.name}`);
+                    if (cancelButton && !cancelButton.disabled) {
+                        cancelButton.click();
+                        console.log(`자동으로 승인취소 버튼이 클릭되었습니다: ${data.name}`);
+                    }
+                }
             });
         }
 
         // 서버로 명령 전송 함수
         function sendCommand(command, clientName) {
             socket.emit('send_command', { command: command, name: clientName });
+            console.log(`명령 전송: ${command} - ${clientName}`);
         }
 
-        // 서버로부터 승인 상태 업데이트 수신
-        socket.on('update_approval_status', (data) => {
-            console.log('승인 상태 업데이트:', data);
-            if (clientData[data.name]) {
-                clientData[data.name].isApproved = data.isApproved;
-                updateTable();
+        // 목표 수익금 설정 함수
+        function setTargetProfit(clientName) {
+            const input = document.getElementById(`target-profit-${clientName}`);
+            const targetProfit = parseFloat(input.value);
+            if (isNaN(targetProfit) || targetProfit <= 0) {
+                alert('유효한 목표 수익금을 입력하세요.');
+                return;
             }
+
+            // 서버로 목표 수익금 전송
+            socket.emit('set_target_profit', { name: clientName, targetProfit: targetProfit });
+            console.log(`목표 수익금 설정: ${clientName} - ${targetProfit} USDT`);
+
+            // 현재 날짜 및 시간 가져오기
+            const currentTime = new Date().toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' });
+
+            // 목표 달성 메시지 표시 (선택 사항)
+            const container = document.getElementById('goal-message-container');
+            const alertDiv = document.createElement('div');
+            alertDiv.classList.add('alert', 'alert-info', 'alert-dismissible', 'fade', 'show');
+            alertDiv.role = 'alert';
+            alertDiv.innerHTML = `
+                <strong>${clientName}:</strong> 목표 수익금이 ${targetProfit.toLocaleString()} USDT로 설정되었습니다. (${currentTime})
+                <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+            `;
+            container.appendChild(alertDiv);
+
+            // 자동으로 사라지도록 설정 (예: 5초 후)
+            setTimeout(() => {
+                const alert = bootstrap.Alert.getOrCreateInstance(alertDiv);
+                alert.close();
+            }, 5000);
+        }
+
+        // 목표 달성 메시지를 표시하는 함수
+        function showGoalAchievedMessage(name, message = '목표를 달성했습니다.') {
+            const container = document.getElementById('goal-message-container');
+            const alertDiv = document.createElement('div');
+            alertDiv.classList.add('alert', 'alert-success', 'alert-dismissible', 'fade', 'show');
+            alertDiv.role = 'alert';
+            alertDiv.innerHTML = `
+                <strong>${name}:</strong> ${message}
+                <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+            `;
+            container.appendChild(alertDiv);
+
+            // 자동으로 사라지도록 설정 (예: 5초 후)
+            setTimeout(() => {
+                const alert = bootstrap.Alert.getOrCreateInstance(alertDiv);
+                alert.close();
+            }, 5000);
+        }
+
+        // 서버로부터 목표 달성 이벤트 수신 시 승인취소 명령 자동 전송
+        socket.on('goal_achieved', (data) => {
+            const { name } = data;
+            // 승인취소 명령 전송
+            sendCommand('cancel_approve', name);
+            console.log(`목표 달성: 승인취소 명령을 전송했습니다: ${name}`);
+            // 목표 달성 메시지 표시
+            showGoalAchievedMessage(name);
         });
     </script>
 </body>

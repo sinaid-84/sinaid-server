@@ -14,8 +14,9 @@ const app = express();
 const server = http.createServer(app);
 const io = socketIo(server, {
     cors: {
-        origin: "*", // 개발 단계에서는 모든 출처를 허용
-        methods: ["GET", "POST"]
+        origin: "*", // 개발 단계에서는 모든 출처를 허용, 프로덕션에서는 특정 도메인으로 제한하는 것이 좋습니다.
+        methods: ["GET", "POST"],
+        credentials: true
     }
 });
 const PORT = process.env.PORT || 5000;
@@ -115,6 +116,9 @@ app.get('/dashboard/reports', isAuthenticated, (req, res) => {
 // 클라이언트 상태를 저장하기 위한 객체
 const clients = {};
 
+// 목표 달성한 클라이언트를 저장할 배열
+const goalAchievedClients = [];
+
 // Socket.IO 이벤트 핸들링
 io.on('connection', (socket) => {
     console.log('클라이언트가 연결되었습니다.');
@@ -129,11 +133,75 @@ io.on('connection', (socket) => {
             username: data.name,
             address: data.user_ip,
             server_status: data.server_status,
-            isApproved: false // 초기 승인 상태는 false
+            isApproved: false, // 초기 승인 상태는 false
+            cumulativeProfit: 0, // 초기 누적 수익금은 0
+            targetProfit: 500, // 초기 목표 수익금은 500
+            goalAchieved: false // 초기 목표 달성 상태는 false
         };
 
         // 웹페이지에 사용자 정보 전송
         io.emit('update_user_info', data);
+    });
+
+    // 'cumulative_profit' 이벤트 처리
+    socket.on('cumulative_profit', (data) => {
+        const { cumulativeProfit: clientProfit } = data;
+        if (typeof clientProfit === 'number' && clientProfit >= 0 && clientProfit < 1e12) { // 예시 조건: 음수나 비정상적으로 큰 값 방지
+            if (clients[socket.id]) {
+                clients[socket.id].cumulativeProfit += clientProfit;
+                console.log(`클라이언트 ${clients[socket.id].username}로부터 누적 수익금 수신: ${clientProfit} USDT`);
+                console.log(`클라이언트 ${clients[socket.id].username}의 전체 누적 수익금: ${clients[socket.id].cumulativeProfit} USDT`);
+
+                // 대시보드에 누적 수익금 업데이트 전송 (per client)
+                io.emit('update_cumulative_profit', { name: clients[socket.id].username, cumulativeProfit: clients[socket.id].cumulativeProfit });
+
+                // 목표 수익금과 비교
+                if (clients[socket.id].cumulativeProfit >= clients[socket.id].targetProfit && !goalAchievedClients.includes(clients[socket.id].username)) {
+                    console.log(`클라이언트 ${clients[socket.id].username}의 목표 수익금 달성!`);
+
+                    // 목표 달성 목록에 추가
+                    goalAchievedClients.push(clients[socket.id].username);
+                    clients[socket.id].goalAchieved = true;
+
+                    // 대시보드에 목표 달성 이벤트 전송
+                    io.emit('goal_achieved', { name: clients[socket.id].username });
+
+                    // "목표를 달성했습니다" 메시지 전송
+                    io.emit('show_goal_message', { name: clients[socket.id].username, message: '목표를 달성했습니다' });
+                }
+            } else {
+                console.log('누적 수익금 수신: 클라이언트 정보가 존재하지 않습니다.');
+            }
+        } else {
+            console.log('잘못된 누적 수익금 데이터 수신:', data);
+        }
+    });
+
+    // 'set_target_profit' 이벤트 처리
+    socket.on('set_target_profit', (data) => {
+        const { name, targetProfit } = data;
+        if (typeof targetProfit === 'number' && targetProfit > 0) {
+            // Find the client by name
+            const targetSocketId = Object.keys(clients).find(id => clients[id].username === name);
+            if (targetSocketId) {
+                clients[targetSocketId].targetProfit = targetProfit;
+                console.log(`클라이언트 ${name}의 목표 수익금이 ${targetProfit} USDT로 설정되었습니다.`);
+
+                // 목표 달성 상태 리셋
+                clients[targetSocketId].goalAchieved = false;
+                const index = goalAchievedClients.indexOf(name);
+                if (index !== -1) {
+                    goalAchievedClients.splice(index, 1);
+                }
+
+                // 대시보드에 목표 수익금 업데이트 전송
+                io.emit('update_target_profit', { name: name, targetProfit: targetProfit });
+            } else {
+                console.log(`목표 수익금 설정: 클라이언트 ${name}을(를) 찾을 수 없습니다.`);
+            }
+        } else {
+            console.log('잘못된 목표 수익금 데이터 수신:', data);
+        }
     });
 
     // 'keep_alive' 이벤트 처리
@@ -150,16 +218,20 @@ io.on('connection', (socket) => {
         if (clients[socket.id]) {
             clients[socket.id].server_status = data.server_status;
         } else {
+            // 클라이언트가 'user_info_update'를 보내지 않고 'update_data'를 보낸 경우 처리
             clients[socket.id] = {
                 socket: socket,
                 username: data.name,
                 address: data.user_ip,
                 server_status: data.server_status,
-                isApproved: false // 초기 승인 상태는 false
+                isApproved: false, // 초기 승인 상태는 false
+                cumulativeProfit: 0, // 초기 누적 수익금은 0
+                targetProfit: 500, // 초기 목표 수익금은 500
+                goalAchieved: false // 초기 목표 달성 상태는 false
             };
         }
 
-        // 소수점 두 자리로 제한
+        // 소수점 두 자리로 반올림
         const roundedData = { ...data };
 
         // 소수점 두 자리로 반올림할 필드 목록
@@ -189,6 +261,12 @@ io.on('connection', (socket) => {
                 targetClient.isApproved = true;
             } else if (command === 'cancel_approve') {
                 targetClient.isApproved = false;
+                // 목표 달성 상태 리셋
+                targetClient.goalAchieved = false;
+                const index = goalAchievedClients.indexOf(targetClient.username);
+                if (index !== -1) {
+                    goalAchievedClients.splice(index, 1);
+                }
             }
 
             // 클라이언트에게 명령 전송

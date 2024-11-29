@@ -8,6 +8,8 @@ const cors = require('cors');
 const session = require('express-session');
 const bcrypt = require('bcryptjs'); // 'bcrypt' 대신 'bcryptjs' 사용
 const bodyParser = require('body-parser');
+const mongoose = require('mongoose'); // mongoose 추가
+const fs = require('fs'); // 파일 시스템 모듈
 require('dotenv').config(); // dotenv 설정
 
 const app = express();
@@ -20,6 +22,28 @@ const io = socketIo(server, {
     }
 });
 const PORT = process.env.PORT || 5000;
+
+// MongoDB 연결 설정
+const mongoURI = process.env.MONGODB_URI || 'mongodb://sinaid:052929@svc.sel4.cloudtype.app:31003';
+
+mongoose.connect(mongoURI)
+    .then(() => console.log('MongoDB에 성공적으로 연결되었습니다.'))
+    .catch(err => console.error('MongoDB 연결 오류:', err));
+
+// 클라이언트 스키마 및 모델 정의
+const clientSchema = new mongoose.Schema({
+    username: String,
+    address: String,
+    server_status: String,
+    isApproved: { type: Boolean, default: false },
+    cumulativeProfit: { type: Number, default: 0 },
+    targetProfit: { type: Number, default: 500 },
+    goalAchieved: { type: Boolean, default: false },
+    socketId: String, // 소켓 ID 저장
+    timestamp: { type: Date, default: Date.now }
+});
+
+const Client = mongoose.model('Client', clientSchema);
 
 // CORS 설정
 app.use(cors());
@@ -44,7 +68,7 @@ app.use(bodyParser.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 // 비밀번호 설정 및 해싱
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "xorhkd12!@";
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "your_admin_password";
 const hashedPassword = bcrypt.hashSync(ADMIN_PASSWORD, 10);
 
 // 인증 미들웨어
@@ -116,58 +140,80 @@ app.get('/dashboard/reports', isAuthenticated, (req, res) => {
 // 클라이언트 상태를 저장하기 위한 객체
 const clients = {};
 
-// 목표 달성한 클라이언트를 저장할 배열
-const goalAchievedClients = [];
+// 목표 달성한 클라이언트를 저장할 배열 (데이터베이스로 대체)
 
 // Socket.IO 이벤트 핸들링
 io.on('connection', (socket) => {
     console.log('클라이언트가 연결되었습니다.');
 
-    // 'user_info_update' 이벤트 처리
-    socket.on('user_info_update', (data) => {
+    // 클라이언트가 처음 연결되었을 때 데이터베이스에서 기존 데이터 로드
+    socket.on('user_info_update', async (data) => {
         console.log('사용자 정보 업데이트:', data);
 
-        // 클라이언트 정보를 저장
-        clients[socket.id] = {
-            socket: socket,
-            username: data.name,
-            address: data.user_ip,
-            server_status: data.server_status,
-            isApproved: false, // 초기 승인 상태는 false
-            cumulativeProfit: 0, // 초기 누적 수익금은 0
-            targetProfit: 500, // 초기 목표 수익금은 500
-            goalAchieved: false // 초기 목표 달성 상태는 false
+        // 데이터베이스에서 해당 클라이언트를 찾거나 새로운 클라이언트 생성
+        let client = await Client.findOne({ username: data.name });
+
+        if (!client) {
+            client = new Client({
+                username: data.name,
+                address: data.user_ip,
+                server_status: data.server_status,
+                socketId: socket.id,
+                isApproved: false, // 초기 승인 상태는 false
+                cumulativeProfit: 0, // 초기 누적 수익금은 0
+                targetProfit: 500, // 초기 목표 수익금은 500
+                goalAchieved: false // 초기 목표 달성 상태는 false
+            });
+            await client.save();
+        } else {
+            // 기존 클라이언트의 소켓 ID와 서버 상태 업데이트
+            client.socketId = socket.id;
+            client.server_status = data.server_status;
+            await client.save();
+        }
+
+        // 클라이언트 정보를 메모리에도 저장
+        clients[client.username] = {
+            ...client._doc,
+            socket: socket
         };
 
         // 웹페이지에 사용자 정보 전송
-        io.emit('update_user_info', data);
+        io.emit('update_user_info', {
+            name: client.username,
+            user_ip: client.address,
+            server_status: client.server_status,
+            timestamp: new Date().toISOString().slice(0, 19).replace('T', ' ')
+        });
     });
 
     // 'cumulative_profit' 이벤트 처리
-    socket.on('cumulative_profit', (data) => {
+    socket.on('cumulative_profit', async (data) => {
         const { cumulativeProfit: clientProfit } = data;
-        if (typeof clientProfit === 'number' && clientProfit >= 0 && clientProfit < 1e12) { // 예시 조건: 음수나 비정상적으로 큰 값 방지
-            if (clients[socket.id]) {
-                clients[socket.id].cumulativeProfit += clientProfit;
-                console.log(`클라이언트 ${clients[socket.id].username}로부터 누적 수익금 수신: ${clientProfit} USDT`);
-                console.log(`클라이언트 ${clients[socket.id].username}의 전체 누적 수익금: ${clients[socket.id].cumulativeProfit} USDT`);
+        if (typeof clientProfit === 'number' && clientProfit >= 0 && clientProfit < 1e12) {
+            const client = await Client.findOne({ socketId: socket.id });
+            if (client) {
+                client.cumulativeProfit += clientProfit;
+                await client.save();
+                console.log(`클라이언트 ${client.username}로부터 누적 수익금 수신: ${clientProfit} USDT`);
+                console.log(`클라이언트 ${client.username}의 전체 누적 수익금: ${client.cumulativeProfit} USDT`);
 
-                // 대시보드에 누적 수익금 업데이트 전송 (per client)
-                io.emit('update_cumulative_profit', { name: clients[socket.id].username, cumulativeProfit: clients[socket.id].cumulativeProfit });
+                // 대시보드에 누적 수익금 업데이트 전송
+                io.emit('update_cumulative_profit', { name: client.username, cumulativeProfit: client.cumulativeProfit });
 
                 // 목표 수익금과 비교
-                if (clients[socket.id].cumulativeProfit >= clients[socket.id].targetProfit && !goalAchievedClients.includes(clients[socket.id].username)) {
-                    console.log(`클라이언트 ${clients[socket.id].username}의 목표 수익금 달성!`);
+                if (client.cumulativeProfit >= client.targetProfit && !client.goalAchieved) {
+                    console.log(`클라이언트 ${client.username}의 목표 수익금 달성!`);
 
-                    // 목표 달성 목록에 추가
-                    goalAchievedClients.push(clients[socket.id].username);
-                    clients[socket.id].goalAchieved = true;
+                    // 목표 달성 상태 업데이트
+                    client.goalAchieved = true;
+                    await client.save();
 
                     // 대시보드에 목표 달성 이벤트 전송
-                    io.emit('goal_achieved', { name: clients[socket.id].username });
+                    io.emit('goal_achieved', { name: client.username });
 
                     // "목표를 달성했습니다" 메시지 전송
-                    io.emit('show_goal_message', { name: clients[socket.id].username, message: '목표를 달성했습니다' });
+                    io.emit('show_goal_message', { name: client.username, message: '목표를 달성했습니다' });
                 }
             } else {
                 console.log('누적 수익금 수신: 클라이언트 정보가 존재하지 않습니다.');
@@ -178,29 +224,34 @@ io.on('connection', (socket) => {
     });
 
     // 'set_target_profit' 이벤트 처리
-    socket.on('set_target_profit', (data) => {
+    socket.on('set_target_profit', async (data, callback) => {
         const { name, targetProfit } = data;
         if (typeof targetProfit === 'number' && targetProfit > 0) {
-            // Find the client by name
-            const targetSocketId = Object.keys(clients).find(id => clients[id].username === name);
-            if (targetSocketId) {
-                clients[targetSocketId].targetProfit = targetProfit;
+            const client = await Client.findOne({ username: name });
+            if (client) {
+                client.targetProfit = targetProfit;
+                client.goalAchieved = false; // 목표 달성 상태 리셋
+                await client.save();
                 console.log(`클라이언트 ${name}의 목표 수익금이 ${targetProfit} USDT로 설정되었습니다.`);
-
-                // 목표 달성 상태 리셋
-                clients[targetSocketId].goalAchieved = false;
-                const index = goalAchievedClients.indexOf(name);
-                if (index !== -1) {
-                    goalAchievedClients.splice(index, 1);
-                }
 
                 // 대시보드에 목표 수익금 업데이트 전송
                 io.emit('update_target_profit', { name: name, targetProfit: targetProfit });
+
+                // 콜백으로 성공 응답 전송
+                if (callback && typeof callback === 'function') {
+                    callback({ status: 'success' });
+                }
             } else {
                 console.log(`목표 수익금 설정: 클라이언트 ${name}을(를) 찾을 수 없습니다.`);
+                if (callback && typeof callback === 'function') {
+                    callback({ status: 'error', message: `클라이언트 ${name}을(를) 찾을 수 없습니다.` });
+                }
             }
         } else {
             console.log('잘못된 목표 수익금 데이터 수신:', data);
+            if (callback && typeof callback === 'function') {
+                callback({ status: 'error', message: 'Invalid targetProfit value.' });
+            }
         }
     });
 
@@ -211,23 +262,44 @@ io.on('connection', (socket) => {
     });
 
     // 'update_data' 이벤트 처리
-    socket.on('update_data', (data) => {
+    socket.on('update_data', async (data) => {
         console.log('받은 데이터:', data);
 
-        // 클라이언트 정보를 업데이트
-        if (clients[socket.id]) {
-            clients[socket.id].server_status = data.server_status;
+        // 데이터베이스에서 클라이언트 정보 업데이트
+        let client = await Client.findOne({ username: data.name });
+
+        if (client) {
+            client.total_balance = data.total_balance || client.total_balance;
+            client.current_profit_rate = data.current_profit_rate || client.current_profit_rate;
+            client.unrealized_pnl = data.unrealized_pnl || client.unrealized_pnl;
+            client.current_total_asset = data.current_total_asset || client.current_total_asset;
+            client.server_status = data.server_status || client.server_status;
+            client.timestamp = new Date();
+            await client.save();
+
+            // 메모리의 클라이언트 정보도 업데이트
+            clients[client.username] = {
+                ...client._doc,
+                socket: socket
+            };
         } else {
-            // 클라이언트가 'user_info_update'를 보내지 않고 'update_data'를 보낸 경우 처리
-            clients[socket.id] = {
-                socket: socket,
+            // 클라이언트 정보가 없으면 생성
+            client = new Client({
                 username: data.name,
                 address: data.user_ip,
                 server_status: data.server_status,
+                socketId: socket.id,
                 isApproved: false, // 초기 승인 상태는 false
                 cumulativeProfit: 0, // 초기 누적 수익금은 0
                 targetProfit: 500, // 초기 목표 수익금은 500
                 goalAchieved: false // 초기 목표 달성 상태는 false
+            });
+            await client.save();
+
+            // 메모리에 저장
+            clients[client.username] = {
+                ...client._doc,
+                socket: socket
             };
         }
 
@@ -245,59 +317,92 @@ io.on('connection', (socket) => {
             }
         });
 
+        // 'target_profit'을 제외하고 브로드캐스트
+        delete roundedData.target_profit;
+
         // 모든 클라이언트에게 데이터 브로드캐스트
         io.emit('update_data', roundedData);
     });
 
     // 클라이언트로부터 승인 또는 승인취소 명령을 수신
-    socket.on('send_command', (data) => {
+    socket.on('send_command', async (data) => {
         const { command, name } = data;
-        // 해당 이름의 클라이언트를 찾습니다.
-        const targetClient = Object.values(clients).find(client => client.username === name);
+        // 데이터베이스에서 해당 클라이언트를 찾습니다.
+        const client = await Client.findOne({ username: name });
 
-        if (targetClient) {
+        if (client) {
             // 승인 상태 업데이트
             if (command === 'approve') {
-                targetClient.isApproved = true;
+                client.isApproved = true;
             } else if (command === 'cancel_approve') {
-                targetClient.isApproved = false;
+                client.isApproved = false;
                 // 목표 달성 상태 리셋
-                targetClient.goalAchieved = false;
-                const index = goalAchievedClients.indexOf(targetClient.username);
-                if (index !== -1) {
-                    goalAchievedClients.splice(index, 1);
-                }
+                client.goalAchieved = false;
+            }
+            await client.save();
+
+            // 메모리의 클라이언트 정보도 업데이트
+            clients[client.username] = {
+                ...client._doc,
+                socket: clients[client.username] ? clients[client.username].socket : null
+            };
+
+            // 해당 클라이언트에게 명령 전송
+            if (clients[client.username].socket) {
+                clients[client.username].socket.emit(command, { message: `${command} 명령이 서버에서 전송되었습니다.` });
+                console.log(`클라이언트 ${name}에게 ${command} 명령을 전송했습니다.`);
             }
 
-            // 클라이언트에게 명령 전송
-            targetClient.socket.emit(command, { message: `${command} 명령이 서버에서 전송되었습니다.` });
-            console.log(`클라이언트 ${name}에게 ${command} 명령을 전송했습니다.`);
-
             // 모든 클라이언트에게 승인 상태 업데이트 전송
-            io.emit('update_approval_status', { name: targetClient.username, isApproved: targetClient.isApproved });
+            io.emit('update_approval_status', { name: client.username, isApproved: client.isApproved });
         } else {
             console.log(`클라이언트 ${name}을(를) 찾을 수 없습니다.`);
         }
     });
 
     // 클라이언트 연결 해제 시
-    socket.on('disconnect', () => {
+    socket.on('disconnect', async () => {
         console.log('클라이언트 연결이 해제되었습니다.');
 
-        // 해당 클라이언트의 정보가 있으면 삭제
-        if (clients[socket.id]) {
-            const disconnectedUser = clients[socket.id];
-            delete clients[socket.id];
+        // 데이터베이스에서 해당 클라이언트의 서버 상태를 업데이트
+        const client = await Client.findOne({ socketId: socket.id });
+        if (client) {
+            client.server_status = 'Disconnected';
+            await client.save();
+
+            // 메모리에서 클라이언트 정보 삭제
+            delete clients[client.username];
 
             // 웹페이지에 사용자 상태 업데이트
             const disconnectData = {
-                name: disconnectedUser.username,
-                user_ip: disconnectedUser.address,
+                name: client.username,
+                user_ip: client.address,
                 server_status: 'Disconnected',
                 timestamp: new Date().toISOString().slice(0, 19).replace('T', ' ')
             };
             io.emit('update_user_info', disconnectData);
         }
+    });
+
+    // 'request_initial_data' 이벤트 처리
+    socket.on('request_initial_data', async () => {
+        // 데이터베이스에서 모든 클라이언트 데이터를 가져옵니다.
+        const allClients = await Client.find({});
+        const allUserData = allClients.map(client => ({
+            name: client.username,
+            user_ip: client.address,
+            total_balance: client.total_balance || 0,
+            current_profit_rate: client.current_profit_rate || 0,
+            unrealized_pnl: client.unrealized_pnl || 0,
+            current_total_asset: client.current_total_asset || 0,
+            cumulative_profit: client.cumulativeProfit,
+            target_profit: client.targetProfit,
+            server_status: client.server_status,
+            isApproved: client.isApproved,
+            timestamp: client.timestamp ? client.timestamp.toISOString().slice(0, 19).replace('T', ' ') : ''
+        }));
+
+        socket.emit('initial_data', allUserData);
     });
 });
 

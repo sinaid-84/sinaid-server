@@ -68,7 +68,7 @@ app.use(bodyParser.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 // 비밀번호 설정 및 해싱
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "your_admin_password";
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "xorhkd12!@";
 const hashedPassword = bcrypt.hashSync(ADMIN_PASSWORD, 10);
 
 // 인증 미들웨어

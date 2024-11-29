@@ -106,6 +106,21 @@
         // 서버에 연결되었을 때
         socket.on('connect', () => {
             console.log('서버에 연결되었습니다.');
+            // 서버에 초기 데이터를 요청합니다.
+            socket.emit('request_initial_data');
+        });
+
+        // 서버로부터 초기 데이터 수신
+        socket.on('initial_data', (allUserData) => {
+            console.log('서버로부터 초기 데이터 수신:', allUserData);
+
+            // 수신한 데이터를 clientData에 저장
+            allUserData.forEach(data => {
+                clientData[data.name] = data;
+            });
+
+            // 테이블 업데이트
+            updateTable();
         });
 
         // 서버로부터 사용자 정보 업데이트 수신

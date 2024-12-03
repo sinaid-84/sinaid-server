@@ -10,14 +10,14 @@ const bcrypt = require('bcryptjs'); // 'bcrypt' 대신 'bcryptjs' 사용
 const bodyParser = require('body-parser');
 const mongoose = require('mongoose'); // mongoose 추가
 const fs = require('fs'); // 파일 시스템 모듈
-require('dotenv').config(); // dotenv 설정
 const { v4: uuidv4 } = require('uuid'); // 고유 ID 생성용 UUID
+require('dotenv').config(); // dotenv 설정
 
 const app = express();
 const server = http.createServer(app);
 const io = socketIo(server, {
     cors: {
-        origin: "*", // 개발 단계에서는 모든 출처를 허용, 프로덕션에서는 특정 도메인으로 제한하는 것이 좋습니다.
+        origin: "http://your-frontend-domain.com", // 프로덕션에서는 특정 도메인으로 변경
         methods: ["GET", "POST"],
         credentials: true
     },
@@ -33,22 +33,22 @@ const mongoURI = process.env.MONGODB_URI || 'mongodb://sinaid:052929@svc.sel4.cl
 mongoose.connect(mongoURI, {
     useNewUrlParser: true,
     useUnifiedTopology: true,
-    poolSize: 20, // 연결 풀 크기 증가
-    bufferMaxEntries: 0 // 버퍼링 비활성화
+    maxPoolSize: 20 // 연결 풀 크기 증가
+    // bufferMaxEntries: 0 // 제거
 })
     .then(() => console.log('MongoDB에 성공적으로 연결되었습니다.'))
     .catch(err => console.error('MongoDB 연결 오류:', err));
 
 // 클라이언트 스키마 및 모델 정의
 const clientSchema = new mongoose.Schema({
-    username: { type: String, unique: true }, // 고유한 사용자 이름
-    address: String,
-    server_status: String,
+    username: { type: String, unique: true, required: true }, // 고유한 사용자 이름
+    address: { type: String, required: true },
+    server_status: { type: String, required: true },
     isApproved: { type: Boolean, default: false },
     cumulativeProfit: { type: Number, default: 0 },
     targetProfit: { type: Number, default: 500 },
     goalAchieved: { type: Boolean, default: false },
-    socketId: { type: String, unique: true }, // 소켓 ID 저장, 고유하게 설정
+    socketId: { type: String, unique: true, required: true }, // 소켓 ID 저장, 고유하게 설정
     timestamp: { type: Date, default: Date.now }
 });
 
@@ -89,7 +89,7 @@ function isAuthenticated(req, res, next) {
     if (req.session.isAuthenticated) {
         next();
     } else {
-        res.redirect('/login'); // 메인 페이지로 리디렉션
+        res.redirect('/login'); // 로그인 페이지로 리디렉션
     }
 }
 
@@ -166,9 +166,6 @@ io.on('connection', (socket) => {
                 socket.emit('error', { message: '잘못된 사용자 정보 데이터입니다.' });
                 return;
             }
-
-            // 고유한 사용자 이름 생성 (UUID 추가)
-            const uniqueUsername = `${data.name}_${uuidv4()}`;
 
             // 데이터베이스에서 해당 클라이언트를 찾거나 새로운 클라이언트 생성
             let client = await Client.findOne({ username: data.name });
@@ -364,10 +361,7 @@ io.on('connection', (socket) => {
             // 'target_profit'을 제외하고 브로드캐스트
             delete roundedData.target_profit;
 
-            // 특정 클라이언트에게만 데이터 브로드캐스트 (필요 시)
-            // 예: io.to(client.socketId).emit('update_data', roundedData);
-
-            // 모든 클라이언트에게 데이터 브로드캐스트 (최적화 필요 시 변경)
+            // 모든 클라이언트에게 데이터 브로드캐스트
             io.emit('update_data', roundedData);
         } catch (error) {
             console.error('update_data 처리 중 오류:', error);

@@ -17,7 +17,7 @@ const app = express();
 const server = http.createServer(app);
 const io = socketIo(server, {
     cors: {
-        origin: "http://your-frontend-domain.com", // 프로덕션에서는 특정 도메인으로 변경
+        origin: "https://port-0-sinaid-server-m1onak5031836227.sel4.cloudtype.app", // 프로덕션에서는 특정 도메인으로 변경
         methods: ["GET", "POST"],
         credentials: true
     },

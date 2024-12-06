@@ -12,32 +12,53 @@ const mongoose = require('mongoose'); // mongoose 추가
 const fs = require('fs'); // 파일 시스템 모듈
 const { v4: uuidv4 } = require('uuid'); // 고유 ID 생성용 UUID
 require('dotenv').config(); // dotenv 설정
+const winston = require('winston'); // 로깅 라이브러리 추가
+
+// 로깅 설정
+const logger = winston.createLogger({
+    level: 'info',
+    format: winston.format.combine(
+        winston.format.timestamp(),
+        winston.format.json()
+    ),
+    transports: [
+        new winston.transports.File({ filename: 'error.log', level: 'error' }),
+        new winston.transports.File({ filename: 'combined.log' })
+    ]
+});
+
+// 개발 환경에서는 콘솔에도 로그 출력
+if (process.env.NODE_ENV !== 'production') {
+    logger.add(new winston.transports.Console({
+        format: winston.format.simple()
+    }));
+}
 
 const app = express();
 const server = http.createServer(app);
 const io = socketIo(server, {
     cors: {
-        origin: "https://port-0-sinaid-server-m1onak5031836227.sel4.cloudtype.app", // 프로덕션에서는 특정 도메인으로 변경
+        origin: "https://port-0-sinaid-server-m1onak5031836227.sel4.cloudtype.app", // 실제 프론트엔드 도메인으로 변경
         methods: ["GET", "POST"],
         credentials: true
     },
-    pingTimeout: 60000, // 기본값보다 늘려 안정성 향상
-    pingInterval: 25000, // 기본값보다 줄여 빠른 감지
+    pingTimeout: 35000, // 기존 10000ms에서 30000ms로 연장하여 네트워크 지연에도 안정적 유지
+    pingInterval: 25000, // 기본값 유지
     maxHttpBufferSize: 1e6 // 버퍼 크기 제한 (1MB)
 });
 const PORT = process.env.PORT || 5000;
 
 // MongoDB 연결 설정
+// maxPoolSize를 20에서 50으로 증가시켜 더 많은 동시 연결 처리
 const mongoURI = process.env.MONGODB_URI || 'mongodb://sinaid:052929@svc.sel4.cloudtype.app:31003';
 
 mongoose.connect(mongoURI, {
     useNewUrlParser: true,
     useUnifiedTopology: true,
-    maxPoolSize: 20 // 연결 풀 크기 증가
-    // bufferMaxEntries: 0 // 제거
+    maxPoolSize: 50 // 기존 20에서 50으로 증가
 })
-    .then(() => console.log('MongoDB에 성공적으로 연결되었습니다.'))
-    .catch(err => console.error('MongoDB 연결 오류:', err));
+    .then(() => logger.info('MongoDB에 성공적으로 연결되었습니다.'))
+    .catch(err => logger.error('MongoDB 연결 오류:', err));
 
 // 클라이언트 스키마 및 모델 정의
 const clientSchema = new mongoose.Schema({
@@ -56,7 +77,7 @@ const Client = mongoose.model('Client', clientSchema);
 
 // CORS 설정
 app.use(cors({
-    origin: "http://your-frontend-domain.com", // 프로덕션에서는 특정 도메인으로 변경
+    origin: "https://port-0-sinaid-server-m1onak5031836227.sel4.cloudtype.app", // 실제 프론트엔드 도메인으로 변경
     methods: ["GET", "POST"],
     credentials: true
 }));
@@ -106,12 +127,13 @@ app.get('/login', (req, res) => {
 // 로그인 처리 라우트
 app.post('/login', (req, res) => {
     const { password } = req.body;
+    logger.info(`로그인 시도: 비밀번호 입력됨`);
     if (bcrypt.compareSync(password, hashedPassword)) {
         req.session.isAuthenticated = true;
-        console.log('로그인 성공: 세션 설정 완료');
+        logger.info('로그인 성공: 세션 설정 완료');
         res.redirect('/dashboard');
     } else {
-        console.log('로그인 실패: 비밀번호 불일치');
+        logger.warn('로그인 실패: 비밀번호 불일치');
         // 로그인 실패 시, 다시 로그인 페이지로 리디렉션하면서 에러 메시지 전달
         res.send(`
             <script>
@@ -126,8 +148,10 @@ app.post('/login', (req, res) => {
 app.get('/logout', (req, res) => {
     req.session.destroy((err) => {
         if (err) {
+            logger.error('로그아웃 중 오류 발생:', err);
             return res.redirect('/dashboard');
         }
+        logger.info('로그아웃 성공: 세션 파기 완료');
         res.redirect('/');
     });
 });
@@ -155,15 +179,16 @@ const clients = {};
 
 // Socket.IO 이벤트 핸들링
 io.on('connection', (socket) => {
-    console.log('클라이언트가 연결되었습니다.');
+    logger.info(`클라이언트가 연결되었습니다. Socket ID: ${socket.id}`);
 
     // 클라이언트가 처음 연결되었을 때 데이터베이스에서 기존 데이터 로드
     socket.on('user_info_update', async (data) => {
-        console.log('사용자 정보 업데이트:', data);
+        logger.info(`사용자 정보 업데이트 요청: ${JSON.stringify(data)}`);
         try {
             // 데이터 검증
             if (!data.name || !data.user_ip || !data.server_status) {
                 socket.emit('error', { message: '잘못된 사용자 정보 데이터입니다.' });
+                logger.warn('user_info_update: 잘못된 데이터');
                 return;
             }
 
@@ -182,11 +207,13 @@ io.on('connection', (socket) => {
                     goalAchieved: false // 초기 목표 달성 상태는 false
                 });
                 await client.save();
+                logger.info(`새 클라이언트 생성: ${data.name}`);
             } else {
                 // 기존 클라이언트의 소켓 ID와 서버 상태 업데이트
                 client.socketId = socket.id;
                 client.server_status = data.server_status;
                 await client.save();
+                logger.info(`기존 클라이언트 업데이트: ${data.name}`);
             }
 
             // 클라이언트 정보를 메모리에도 저장
@@ -203,13 +230,14 @@ io.on('connection', (socket) => {
                 timestamp: new Date().toISOString().slice(0, 19).replace('T', ' ')
             });
         } catch (error) {
-            console.error('user_info_update 처리 중 오류:', error);
+            logger.error('user_info_update 처리 중 오류:', error);
             socket.emit('error', { message: '사용자 정보 업데이트 중 오류가 발생했습니다.' });
         }
     });
 
     // 'cumulative_profit' 이벤트 처리
     socket.on('cumulative_profit', async (data) => {
+        logger.info(`cumulative_profit 이벤트 수신: ${JSON.stringify(data)}`);
         try {
             const { cumulativeProfit: clientProfit } = data;
             if (typeof clientProfit === 'number' && clientProfit >= 0 && clientProfit < 1e12) {
@@ -217,15 +245,14 @@ io.on('connection', (socket) => {
                 if (client) {
                     client.cumulativeProfit += clientProfit;
                     await client.save();
-                    console.log(`클라이언트 ${client.username}로부터 누적 수익금 수신: ${clientProfit} USDT`);
-                    console.log(`클라이언트 ${client.username}의 전체 누적 수익금: ${client.cumulativeProfit} USDT`);
+                    logger.info(`클라이언트 ${client.username}의 누적 수익금: ${client.cumulativeProfit} USDT`);
 
                     // 대시보드에 누적 수익금 업데이트 전송
                     io.emit('update_cumulative_profit', { name: client.username, cumulativeProfit: client.cumulativeProfit });
 
                     // 목표 수익금과 비교
                     if (client.cumulativeProfit >= client.targetProfit && !client.goalAchieved) {
-                        console.log(`클라이언트 ${client.username}의 목표 수익금 달성!`);
+                        logger.info(`클라이언트 ${client.username}의 목표 수익금 달성!`);
 
                         // 목표 달성 상태 업데이트
                         client.goalAchieved = true;
@@ -238,20 +265,21 @@ io.on('connection', (socket) => {
                         io.to(client.socketId).emit('show_goal_message', { message: '목표를 달성했습니다' });
                     }
                 } else {
-                    console.log('누적 수익금 수신: 클라이언트 정보가 존재하지 않습니다.');
+                    logger.warn('cumulative_profit: 클라이언트 정보가 존재하지 않습니다.');
                 }
             } else {
-                console.log('잘못된 누적 수익금 데이터 수신:', data);
+                logger.warn(`잘못된 누적 수익금 데이터 수신: ${JSON.stringify(data)}`);
                 socket.emit('error', { message: '잘못된 누적 수익금 데이터입니다.' });
             }
         } catch (error) {
-            console.error('cumulative_profit 처리 중 오류:', error);
+            logger.error('cumulative_profit 처리 중 오류:', error);
             socket.emit('error', { message: '누적 수익금 업데이트 중 오류가 발생했습니다.' });
         }
     });
 
     // 'set_target_profit' 이벤트 처리
     socket.on('set_target_profit', async (data, callback) => {
+        logger.info(`set_target_profit 이벤트 수신: ${JSON.stringify(data)}`);
         try {
             const { name, targetProfit } = data;
             if (typeof targetProfit === 'number' && targetProfit > 0) {
@@ -260,7 +288,7 @@ io.on('connection', (socket) => {
                     client.targetProfit = targetProfit;
                     client.goalAchieved = false; // 목표 달성 상태 리셋
                     await client.save();
-                    console.log(`클라이언트 ${name}의 목표 수익금이 ${targetProfit} USDT로 설정되었습니다.`);
+                    logger.info(`클라이언트 ${name}의 목표 수익금이 ${targetProfit} USDT로 설정되었습니다.`);
 
                     // 대시보드에 목표 수익금 업데이트 전송
                     io.emit('update_target_profit', { name: name, targetProfit: targetProfit });
@@ -270,19 +298,19 @@ io.on('connection', (socket) => {
                         callback({ status: 'success' });
                     }
                 } else {
-                    console.log(`목표 수익금 설정: 클라이언트 ${name}을(를) 찾을 수 없습니다.`);
+                    logger.warn(`set_target_profit: 클라이언트 ${name}을(를) 찾을 수 없습니다.`);
                     if (callback && typeof callback === 'function') {
                         callback({ status: 'error', message: `클라이언트 ${name}을(를) 찾을 수 없습니다.` });
                     }
                 }
             } else {
-                console.log('잘못된 목표 수익금 데이터 수신:', data);
+                logger.warn(`set_target_profit: 잘못된 목표 수익금 데이터 수신: ${JSON.stringify(data)}`);
                 if (callback && typeof callback === 'function') {
                     callback({ status: 'error', message: 'Invalid targetProfit value.' });
                 }
             }
         } catch (error) {
-            console.error('set_target_profit 처리 중 오류:', error);
+            logger.error('set_target_profit 처리 중 오류:', error);
             if (callback && typeof callback === 'function') {
                 callback({ status: 'error', message: '목표 수익금 설정 중 오류가 발생했습니다.' });
             }
@@ -292,19 +320,20 @@ io.on('connection', (socket) => {
     // 'keep_alive' 이벤트 처리
     socket.on('keep_alive', (data) => {
         try {
-            console.log(`클라이언트 ${data.name}로부터 keep_alive 수신`);
+            logger.info(`keep_alive 이벤트 수신: ${JSON.stringify(data)}`);
             // 필요한 경우 추가 처리
         } catch (error) {
-            console.error('keep_alive 처리 중 오류:', error);
+            logger.error('keep_alive 처리 중 오류:', error);
         }
     });
 
     // 'update_data' 이벤트 처리
     socket.on('update_data', async (data) => {
-        console.log('받은 데이터:', data);
+        logger.info(`update_data 이벤트 수신: ${JSON.stringify(data)}`);
         try {
             if (!data.name) {
                 socket.emit('error', { message: '데이터에 사용자 이름이 포함되어 있지 않습니다.' });
+                logger.warn('update_data: 사용자 이름 누락');
                 return;
             }
 
@@ -316,7 +345,10 @@ io.on('connection', (socket) => {
                 client.current_profit_rate = typeof data.current_profit_rate === 'number' ? data.current_profit_rate : client.current_profit_rate;
                 client.unrealized_pnl = typeof data.unrealized_pnl === 'number' ? data.unrealized_pnl : client.unrealized_pnl;
                 client.current_total_asset = typeof data.current_total_asset === 'number' ? data.current_total_asset : client.current_total_asset;
-                client.server_status = data.server_status || client.server_status;
+                // server_status는 'Connected'로 유지해야 합니다.
+                if (data.server_status) {
+                    client.server_status = data.server_status;
+                }
                 client.timestamp = new Date();
                 await client.save();
 
@@ -364,17 +396,19 @@ io.on('connection', (socket) => {
             // 모든 클라이언트에게 데이터 브로드캐스트
             io.emit('update_data', roundedData);
         } catch (error) {
-            console.error('update_data 처리 중 오류:', error);
+            logger.error('update_data 처리 중 오류:', error);
             socket.emit('error', { message: '데이터 업데이트 중 오류가 발생했습니다.' });
         }
     });
 
     // 클라이언트로부터 승인 또는 승인취소 명령을 수신
     socket.on('send_command', async (data) => {
+        logger.info(`send_command 이벤트 수신: ${JSON.stringify(data)}`);
         try {
             const { command, name } = data;
             if (!command || !name) {
                 socket.emit('error', { message: '명령 또는 사용자 이름이 누락되었습니다.' });
+                logger.warn('send_command: 명령 또는 사용자 이름 누락');
                 return;
             }
 
@@ -391,6 +425,7 @@ io.on('connection', (socket) => {
                     client.goalAchieved = false;
                 } else {
                     socket.emit('error', { message: '알 수 없는 명령입니다.' });
+                    logger.warn(`send_command: 알 수 없는 명령 - ${command}`);
                     return;
                 }
                 await client.save();
@@ -403,24 +438,24 @@ io.on('connection', (socket) => {
                 // 해당 클라이언트에게 명령 전송
                 if (client.socketId) {
                     io.to(client.socketId).emit(command, { message: `${command} 명령이 서버에서 전송되었습니다.` });
-                    console.log(`클라이언트 ${name}에게 ${command} 명령을 전송했습니다.`);
+                    logger.info(`클라이언트 ${name}에게 ${command} 명령을 전송했습니다.`);
                 }
 
                 // 모든 클라이언트에게 승인 상태 업데이트 전송
                 io.emit('update_approval_status', { name: client.username, isApproved: client.isApproved });
             } else {
-                console.log(`클라이언트 ${name}을(를) 찾을 수 없습니다.`);
+                logger.warn(`send_command: 클라이언트 ${name}을(를) 찾을 수 없습니다.`);
                 socket.emit('error', { message: `클라이언트 ${name}을(를) 찾을 수 없습니다.` });
             }
         } catch (error) {
-            console.error('send_command 처리 중 오류:', error);
+            logger.error('send_command 처리 중 오류:', error);
             socket.emit('error', { message: '명령 전송 중 오류가 발생했습니다.' });
         }
     });
 
     // 클라이언트 연결 해제 시
     socket.on('disconnect', async () => {
-        console.log('클라이언트 연결이 해제되었습니다.');
+        logger.info(`클라이언트 연결 해제됨. Socket ID: ${socket.id}`);
         try {
             const client = await Client.findOne({ socketId: socket.id });
             if (client) {
@@ -438,14 +473,16 @@ io.on('connection', (socket) => {
                     timestamp: new Date().toISOString().slice(0, 19).replace('T', ' ')
                 };
                 io.emit('update_user_info', disconnectData);
+                logger.info(`클라이언트 ${client.username}의 상태를 'Disconnected'로 업데이트`);
             }
         } catch (error) {
-            console.error('disconnect 처리 중 오류:', error);
+            logger.error('disconnect 처리 중 오류:', error);
         }
     });
 
     // 'request_initial_data' 이벤트 처리
     socket.on('request_initial_data', async () => {
+        logger.info('request_initial_data 이벤트 수신');
         try {
             // 데이터베이스에서 모든 클라이언트 데이터를 가져옵니다.
             const allClients = await Client.find({});
@@ -464,8 +501,9 @@ io.on('connection', (socket) => {
             }));
 
             socket.emit('initial_data', allUserData);
+            logger.info('initial_data 이벤트 전송 완료');
         } catch (error) {
-            console.error('request_initial_data 처리 중 오류:', error);
+            logger.error('request_initial_data 처리 중 오류:', error);
             socket.emit('error', { message: '초기 데이터 요청 처리 중 오류가 발생했습니다.' });
         }
     });
@@ -473,5 +511,5 @@ io.on('connection', (socket) => {
 
 // 서버 시작
 server.listen(PORT, () => {
-    console.log(`서버가 포트 ${PORT}에서 실행 중입니다.`);
+    logger.info(`서버가 포트 ${PORT}에서 실행 중입니다.`);
 });

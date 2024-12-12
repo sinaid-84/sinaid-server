@@ -1,140 +1,354 @@
 // server.js
-
+require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
 const path = require('path');
 const cors = require('cors');
 const session = require('express-session');
-const bcrypt = require('bcryptjs'); // 'bcrypt' 대신 'bcryptjs' 사용
+const bcrypt = require('bcryptjs');
 const bodyParser = require('body-parser');
-const mongoose = require('mongoose'); // mongoose 추가
-const fs = require('fs'); // 파일 시스템 모듈
-const { v4: uuidv4 } = require('uuid'); // 고유 ID 생성용 UUID
-require('dotenv').config(); // dotenv 설정
-const winston = require('winston'); // 로깅 라이브러리 추가
+const mongoose = require('mongoose');
+const fs = require('fs');
+const { v4: uuidv4 } = require('uuid');
+const winston = require('winston');
+const { createLogger, format, transports } = winston;
+require('winston-daily-rotate-file');
+const compression = require('compression');
+const MongoStore = require('connect-mongo');
 
-// 로깅 설정
-const logger = winston.createLogger({
+// 로깅 설정 (DailyRotateFile 사용)
+const logTransport = new transports.DailyRotateFile({
+    filename: 'app-%DATE%.log',
+    dirname: 'logs',
+    datePattern: 'YYYY-MM-DD',
+    maxSize: '20m',
+    maxFiles: '14d'
+});
+
+const logger = createLogger({
     level: 'info',
-    format: winston.format.combine(
-        winston.format.timestamp(),
-        winston.format.json()
+    format: format.combine(
+        format.timestamp(),
+        format.json()
     ),
     transports: [
-        new winston.transports.File({ filename: 'error.log', level: 'error' }),
-        new winston.transports.File({ filename: 'combined.log' })
+        logTransport,
+        new transports.Console({ format: format.simple() })
     ]
 });
 
-// 개발 환경에서는 콘솔에도 로그 출력
-if (process.env.NODE_ENV !== 'production') {
-    logger.add(new winston.transports.Console({
-        format: winston.format.simple()
-    }));
-}
-
 const app = express();
-const server = http.createServer(app);
-const io = socketIo(server, {
-    cors: {
-        origin: "https://port-0-sinaid-server-m1onak5031836227.sel4.cloudtype.app", // 실제 프론트엔드 도메인으로 변경
-        methods: ["GET", "POST"],
-        credentials: true
-    },
-    pingTimeout: 35000, // 기존 10000ms에서 30000ms로 연장하여 네트워크 지연에도 안정적 유지
-    pingInterval: 25000, // 기본값 유지
-    maxHttpBufferSize: 1e6 // 버퍼 크기 제한 (1MB)
-});
-const PORT = process.env.PORT || 5000;
-
-// MongoDB 연결 설정
-// maxPoolSize를 20에서 50으로 증가시켜 더 많은 동시 연결 처리
-const mongoURI = process.env.MONGODB_URI || 'mongodb://sinaid:052929@svc.sel4.cloudtype.app:31003';
-
-mongoose.connect(mongoURI, {
-    useNewUrlParser: true,
-    useUnifiedTopology: true,
-    maxPoolSize: 50 // 기존 20에서 50으로 증가
-})
-    .then(() => logger.info('MongoDB에 성공적으로 연결되었습니다.'))
-    .catch(err => logger.error('MongoDB 연결 오류:', err));
-
-// 클라이언트 스키마 및 모델 정의
-const clientSchema = new mongoose.Schema({
-    username: { type: String, unique: true, required: true }, // 고유한 사용자 이름
-    address: { type: String, required: true },
-    server_status: { type: String, required: true },
-    isApproved: { type: Boolean, default: false },
-    cumulativeProfit: { type: Number, default: 0 },
-    targetProfit: { type: Number, default: 500 },
-    goalAchieved: { type: Boolean, default: false },
-    socketId: { type: String, unique: true, required: true }, // 소켓 ID 저장, 고유하게 설정
-    timestamp: { type: Date, default: Date.now }
-});
-
-const Client = mongoose.model('Client', clientSchema);
-
-// CORS 설정
 app.use(cors({
-    origin: "https://port-0-sinaid-server-m1onak5031836227.sel4.cloudtype.app", // 실제 프론트엔드 도메인으로 변경
+    origin: "https://port-0-sinaid-server-m1onak5031836227.sel4.cloudtype.app",
     methods: ["GET", "POST"],
     credentials: true
 }));
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
+app.use(express.static(path.join(__dirname, 'public')));
+app.use(compression());
 
-// 세션 설정
+// 세션 설정(MongoDB 세션 스토어)
 app.use(session({
+    store: MongoStore.create({
+        mongoUrl: process.env.MONGODB_URI || 'mongodb://sinaid:052929@svc.sel4.cloudtype.app:31003/sinid?authSource=admin',
+        ttl: 60 * 60,
+        autoRemove: 'native'
+    }),
     secret: process.env.SESSION_SECRET || 'your_secret_key',
     resave: false,
     saveUninitialized: false,
-    cookie: { 
-        secure: process.env.NODE_ENV === 'production', // 프로덕션 환경에서는 true
+    cookie: {
+        secure: false,
         httpOnly: true,
-        maxAge: 60 * 60 * 1000 // 1시간 유효
+        maxAge: 60 * 60 * 1000
     }
 }));
 
-// Body Parser 설정
-app.use(bodyParser.urlencoded({ extended: true }));
-app.use(bodyParser.json());
+const server = http.createServer(app);
+const io = socketIo(server, {
+    cors: {
+        origin: "http://localhost:5000",
+        methods: ["GET", "POST"],
+        credentials: true
+    },
+    pingTimeout: 60000,
+    pingInterval: 25000,
+    maxHttpBufferSize: 1e6
+});
 
-// 정적 파일 서빙
-app.use(express.static(path.join(__dirname, 'public')));
+// MongoDB 연결
+const mongoOptions = {
+    maxPoolSize: 50,
+    serverSelectionTimeoutMS: 5000,
+    socketTimeoutMS: 45000,
+    family: 4
+};
 
-// 비밀번호 설정 및 해싱
+mongoose.connect(process.env.MONGODB_URI || 'mongodb://sinaid:052929@svc.sel4.cloudtype.app:31003/sinid?authSource=admin', mongoOptions)
+    .then(() => {
+        logger.info('MongoDB 연결 성공');
+    })
+    .catch((err) => {
+        logger.error('MongoDB 연결 오류:', err);
+    });
+
+mongoose.connection.on('error', (err) => {
+    logger.error('MongoDB 연결 오류:', err);
+});
+
+mongoose.connection.on('disconnected', () => {
+    logger.warn('MongoDB 연결 끊김. 재연결 시도...');
+    setTimeout(() => {
+        mongoose.connect(process.env.MONGODB_URI || 'mongodb://sinaid:052929@svc.sel4.cloudtype.app:31003/sinid?authSource=admin', mongoOptions)
+            .catch(err => logger.error('MongoDB 재연결 실패:', err));
+    }, 5000);
+});
+
+// 스키마 정의
+const clientSchema = new mongoose.Schema({
+    username: { type: String, unique: true, required: true },
+    address: { type: String, required: true },
+    server_status: { type: String, required: true },
+    isApproved: { type: Boolean, default: false },
+    cumulativeProfit: { type: Number, default: 0 }, // 누적 수익금 필드
+    targetProfit: { type: Number, default: 500 },
+    goalAchieved: { type: Boolean, default: false },
+    socketId: { type: String, unique: true, sparse: true },
+    lastActive: { type: Date, default: Date.now },
+    connectionHistory: [{
+        status: String,
+        timestamp: { type: Date, default: Date.now },
+        disconnectReason: String
+    }],
+    settings: {
+        defaultTargetProfit: { type: Number, default: 500 },
+        notificationsEnabled: { type: Boolean, default: true },
+        riskLevel: { type: String, default: 'medium' }
+    },
+    total_balance: { type: Number, default: 0 },
+    current_profit_rate: { type: Number, default: 0 },
+    unrealized_pnl: { type: Number, default: 0 },
+    current_total_asset: { type: Number, default: 0 }
+});
+
+const tradeHistorySchema = new mongoose.Schema({
+    username: { type: String, required: true, index: true },
+    type: { type: String, required: true },
+    symbol: { type: String, required: true },
+    amount: { type: Number, required: true },
+    price: { type: Number, required: true },
+    profit: { type: Number, default: 0 },
+    timestamp: { type: Date, default: Date.now, index: true }
+});
+
+const profitHistorySchema = new mongoose.Schema({
+    username: { type: String, required: true, index: true },
+    dailyProfit: { type: Number, required: true },
+    cumulativeProfit: { type: Number, required: true },
+    tradeCount: { type: Number, default: 0 },
+    timestamp: { type: Date, default: Date.now, index: true }
+});
+
+const Client = mongoose.model('Client', clientSchema);
+const TradeHistory = mongoose.model('TradeHistory', tradeHistorySchema);
+const ProfitHistory = mongoose.model('ProfitHistory', profitHistorySchema);
+
+class ConnectionManager {
+    constructor() {
+        this.connections = new Map();
+        this.heartbeatInterval = 20000; // 20초
+        this.maxReconnectAttempts = 5;
+        this.cleanupInterval = 300000; // 5분
+        this.startCleanup();
+    }
+
+    addConnection(socketId, clientInfo) {
+        this.connections.set(socketId, {
+            ...clientInfo,
+            lastActive: Date.now(),
+            reconnectAttempts: 0,
+            status: 'Connected'
+        });
+    }
+
+    removeConnection(socketId) {
+        this.connections.delete(socketId);
+    }
+
+    updateLastActive(socketId) {
+        const connection = this.connections.get(socketId);
+        if (connection) {
+            connection.lastActive = Date.now();
+        }
+    }
+
+    async handleStaleConnections() {
+        const staleThreshold = Date.now() - this.heartbeatInterval * 3;
+        for (const [socketId, connection] of this.connections) {
+            if (connection.lastActive < staleThreshold) {
+                try {
+                    const client = await Client.findOne({ socketId: socketId });
+                    if (client) {
+                        client.server_status = 'Disconnected';
+                        client.lastActive = new Date();
+                        client.connectionHistory.push({
+                            status: 'Disconnected',
+                            timestamp: new Date(),
+                            disconnectReason: 'Stale connection'
+                        });
+                        await client.save();
+                    }
+                    this.removeConnection(socketId);
+                    logger.warn(`Stale connection removed: ${socketId}`);
+                } catch (error) {
+                    logger.error('Stale connection cleanup error:', error);
+                }
+            }
+        }
+    }
+
+    startCleanup() {
+        setInterval(() => {
+            this.handleStaleConnections();
+        }, this.cleanupInterval);
+    }
+
+    async reconnect(socketId, username) {
+        const connection = this.connections.get(socketId);
+        if (connection) {
+            if (connection.reconnectAttempts >= this.maxReconnectAttempts) {
+                this.removeConnection(socketId);
+                return false;
+            }
+            connection.reconnectAttempts += 1;
+            return true;
+        }
+        return false;
+    }
+
+    getConnectionInfo(socketId) {
+        return this.connections.get(socketId);
+    }
+
+    getAllConnections() {
+        return Array.from(this.connections.entries());
+    }
+}
+
+class TradeManager {
+    constructor() {
+        this.activeTrades = new Map();
+    }
+
+    async recordTrade(tradeData) {
+        try {
+            const trade = new TradeHistory({
+                username: tradeData.username,
+                type: tradeData.type,
+                symbol: tradeData.symbol,
+                amount: tradeData.amount,
+                price: tradeData.price,
+                profit: tradeData.profit
+            });
+            await trade.save();
+
+            return await this.updateProfitHistory(tradeData);
+        } catch (error) {
+            logger.error('거래 기록 오류:', error);
+            return { goalAchieved: false };
+        }
+    }
+
+    async updateProfitHistory(tradeData) {
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+
+        try {
+            let profitRecord = await ProfitHistory.findOne({
+                username: tradeData.username,
+                timestamp: {
+                    $gte: today,
+                    $lt: new Date(today.getTime() + 24 * 60 * 60 * 1000)
+                }
+            });
+
+            if (!profitRecord) {
+                profitRecord = new ProfitHistory({
+                    username: tradeData.username,
+                    dailyProfit: tradeData.profit,
+                    cumulativeProfit: tradeData.profit,
+                    tradeCount: 1
+                });
+            } else {
+                profitRecord.dailyProfit += tradeData.profit;
+                profitRecord.cumulativeProfit += tradeData.profit;
+                profitRecord.tradeCount += 1;
+            }
+
+            await profitRecord.save();
+
+            const client = await Client.findOne({ username: tradeData.username });
+            if (client && !client.goalAchieved && profitRecord.cumulativeProfit >= client.targetProfit) {
+                client.goalAchieved = true;
+                await client.save();
+                return { goalAchieved: true, username: client.username };
+            }
+
+            return { goalAchieved: false };
+        } catch (error) {
+            logger.error('수익 기록 업데이트 오류:', error);
+            return { goalAchieved: false };
+        }
+    }
+
+    async getTradeHistory(username, startDate, endDate) {
+        try {
+            return await TradeHistory.find({
+                username,
+                timestamp: {
+                    $gte: new Date(startDate),
+                    $lte: new Date(endDate)
+                }
+            }).sort({ timestamp: -1 });
+        } catch (error) {
+            logger.error('거래 내역 조회 오류:', error);
+            throw error;
+        }
+    }
+}
+
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "xorhkd12!@";
 const hashedPassword = bcrypt.hashSync(ADMIN_PASSWORD, 10);
 
-// 인증 미들웨어
 function isAuthenticated(req, res, next) {
     if (req.session.isAuthenticated) {
         next();
     } else {
-        res.redirect('/login'); // 로그인 페이지로 리디렉션
+        res.redirect('/login');
     }
 }
 
-// 메인 루트 라우트
+// 라우트
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// 로그인 페이지 라우트
 app.get('/login', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'login.html'));
 });
 
-// 로그인 처리 라우트
 app.post('/login', (req, res) => {
     const { password } = req.body;
-    logger.info(`로그인 시도: 비밀번호 입력됨`);
+    logger.info('로그인 시도');
+
     if (bcrypt.compareSync(password, hashedPassword)) {
         req.session.isAuthenticated = true;
-        logger.info('로그인 성공: 세션 설정 완료');
+        logger.info('로그인 성공');
         res.redirect('/dashboard');
     } else {
-        logger.warn('로그인 실패: 비밀번호 불일치');
-        // 로그인 실패 시, 다시 로그인 페이지로 리디렉션하면서 에러 메시지 전달
+        logger.warn('로그인 실패: 잘못된 비밀번호');
         res.send(`
             <script>
                 alert('비밀번호가 일치하지 않습니다.');
@@ -144,55 +358,79 @@ app.post('/login', (req, res) => {
     }
 });
 
-// 로그아웃 라우트
 app.get('/logout', (req, res) => {
     req.session.destroy((err) => {
         if (err) {
-            logger.error('로그아웃 중 오류 발생:', err);
+            logger.error('로그아웃 중 오류:', err);
             return res.redirect('/dashboard');
         }
-        logger.info('로그아웃 성공: 세션 파기 완료');
+        logger.info('로그아웃 성공');
         res.redirect('/');
     });
 });
 
-// 대시보드 라우트 보호
 app.get('/dashboard', isAuthenticated, (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'dashboard.html'));
 });
 
-// 추가된 대시보드 내 페이지 라우트 보호
-app.get('/dashboard/user-management', isAuthenticated, (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'user-management.html'));
-});
+// 인스턴스 생성
+const tradeManager = new TradeManager();
+const connectionManager = new ConnectionManager();
 
-app.get('/dashboard/settings', isAuthenticated, (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'settings.html'));
-});
+// Socket.IO 이벤트 처리
+io.on('connection', async (socket) => {
+    logger.info(`새로운 클라이언트 연결: ${socket.id}`);
 
-app.get('/dashboard/reports', isAuthenticated, (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'reports.html'));
-});
+    const heartbeat = setInterval(() => {
+        if (socket.connected) {
+            socket.emit('heartbeat');
+        }
+    }, connectionManager.heartbeatInterval);
 
-// 클라이언트 상태를 저장하기 위한 객체
-const clients = {};
-
-// Socket.IO 이벤트 핸들링
-io.on('connection', (socket) => {
-    logger.info(`클라이언트가 연결되었습니다. Socket ID: ${socket.id}`);
-
-    // 클라이언트가 처음 연결되었을 때 데이터베이스에서 기존 데이터 로드
-    socket.on('user_info_update', async (data) => {
-        logger.info(`사용자 정보 업데이트 요청: ${JSON.stringify(data)}`);
+    socket.on('heartbeat-response', async () => {
         try {
-            // 데이터 검증
+            connectionManager.updateLastActive(socket.id);
+            const client = await Client.findOne({ socketId: socket.id });
+            if (client) {
+                client.lastActive = new Date();
+                await client.save();
+            }
+        } catch (error) {
+            logger.error('하트비트 업데이트 오류:', error);
+        }
+    });
+
+    // 초기 데이터 요청
+    socket.on('request_initial_data', async () => {
+        try {
+            const clients = await Client.find({});
+            const allUserData = clients.map(client => ({
+                name: client.username,
+                user_ip: client.address,
+                total_balance: client.total_balance || 0,
+                current_profit_rate: client.current_profit_rate || 0,
+                unrealized_pnl: client.unrealized_pnl || 0,
+                current_total_asset: client.current_total_asset || 0,
+                server_status: client.server_status,
+                timestamp: new Date().toISOString(),
+                cumulative_profit: client.cumulativeProfit || 0,
+                target_profit: client.targetProfit || 500,
+                isApproved: client.isApproved || false
+            }));
+            socket.emit('initial_data', allUserData);
+        } catch (error) {
+            logger.error('초기 데이터 전송 오류:', error);
+            socket.emit('error', { message: '초기 데이터 전송 중 오류가 발생했습니다.' });
+        }
+    });
+
+    socket.on('user_info_update', async (data) => {
+        try {
             if (!data.name || !data.user_ip || !data.server_status) {
                 socket.emit('error', { message: '잘못된 사용자 정보 데이터입니다.' });
-                logger.warn('user_info_update: 잘못된 데이터');
                 return;
             }
 
-            // 데이터베이스에서 해당 클라이언트를 찾거나 새로운 클라이언트 생성
             let client = await Client.findOne({ username: data.name });
 
             if (!client) {
@@ -201,315 +439,337 @@ io.on('connection', (socket) => {
                     address: data.user_ip,
                     server_status: data.server_status,
                     socketId: socket.id,
-                    isApproved: false, // 초기 승인 상태는 false
-                    cumulativeProfit: 0, // 초기 누적 수익금은 0
-                    targetProfit: 500, // 초기 목표 수익금은 500
-                    goalAchieved: false // 초기 목표 달성 상태는 false
+                    connectionHistory: [{
+                        status: 'Connected',
+                        timestamp: new Date()
+                    }]
                 });
-                await client.save();
-                logger.info(`새 클라이언트 생성: ${data.name}`);
             } else {
-                // 기존 클라이언트의 소켓 ID와 서버 상태 업데이트
                 client.socketId = socket.id;
                 client.server_status = data.server_status;
-                await client.save();
-                logger.info(`기존 클라이언트 업데이트: ${data.name}`);
+                client.lastActive = new Date();
+                client.connectionHistory.push({
+                    status: 'Connected',
+                    timestamp: new Date()
+                });
             }
 
-            // 클라이언트 정보를 메모리에도 저장
-            clients[client.username] = {
-                ...client._doc,
-                socket: socket
-            };
+            await client.save();
 
-            // 웹페이지에 사용자 정보 전송 (모든 클라이언트에게 브로드캐스트)
-            io.emit('update_user_info', {
+            connectionManager.addConnection(socket.id, {
+                username: data.name,
+                status: data.server_status
+            });
+
+            const broadcastData = {
                 name: client.username,
                 user_ip: client.address,
                 server_status: client.server_status,
-                timestamp: new Date().toISOString().slice(0, 19).replace('T', ' ')
-            });
+                timestamp: new Date().toISOString(),
+                cumulative_profit: client.cumulativeProfit || 0
+            };
+
+            io.emit('update_user_info', broadcastData);
+
         } catch (error) {
-            logger.error('user_info_update 처리 중 오류:', error);
+            logger.error('사용자 정보 업데이트 오류:', error);
             socket.emit('error', { message: '사용자 정보 업데이트 중 오류가 발생했습니다.' });
         }
     });
 
-    // 'cumulative_profit' 이벤트 처리
-    socket.on('cumulative_profit', async (data) => {
-        logger.info(`cumulative_profit 이벤트 수신: ${JSON.stringify(data)}`);
+    socket.on('trade_executed', async (data) => {
         try {
-            const { cumulativeProfit: clientProfit } = data;
-            if (typeof clientProfit === 'number' && clientProfit >= 0 && clientProfit < 1e12) {
-                const client = await Client.findOne({ socketId: socket.id });
-                if (client) {
-                    client.cumulativeProfit += clientProfit;
-                    await client.save();
-                    logger.info(`클라이언트 ${client.username}의 누적 수익금: ${client.cumulativeProfit} USDT`);
-
-                    // 대시보드에 누적 수익금 업데이트 전송
-                    io.emit('update_cumulative_profit', { name: client.username, cumulativeProfit: client.cumulativeProfit });
-
-                    // 목표 수익금과 비교
-                    if (client.cumulativeProfit >= client.targetProfit && !client.goalAchieved) {
-                        logger.info(`클라이언트 ${client.username}의 목표 수익금 달성!`);
-
-                        // 목표 달성 상태 업데이트
-                        client.goalAchieved = true;
-                        await client.save();
-
-                        // 대시보드에 목표 달성 이벤트 전송
-                        io.emit('goal_achieved', { name: client.username });
-
-                        // "목표를 달성했습니다" 메시지 전송
-                        io.to(client.socketId).emit('show_goal_message', { message: '목표를 달성했습니다' });
-                    }
-                } else {
-                    logger.warn('cumulative_profit: 클라이언트 정보가 존재하지 않습니다.');
-                }
-            } else {
-                logger.warn(`잘못된 누적 수익금 데이터 수신: ${JSON.stringify(data)}`);
-                socket.emit('error', { message: '잘못된 누적 수익금 데이터입니다.' });
-            }
-        } catch (error) {
-            logger.error('cumulative_profit 처리 중 오류:', error);
-            socket.emit('error', { message: '누적 수익금 업데이트 중 오류가 발생했습니다.' });
-        }
-    });
-
-    // 'set_target_profit' 이벤트 처리
-    socket.on('set_target_profit', async (data, callback) => {
-        logger.info(`set_target_profit 이벤트 수신: ${JSON.stringify(data)}`);
-        try {
-            const { name, targetProfit } = data;
-            if (typeof targetProfit === 'number' && targetProfit > 0) {
-                const client = await Client.findOne({ username: name });
-                if (client) {
-                    client.targetProfit = targetProfit;
-                    client.goalAchieved = false; // 목표 달성 상태 리셋
-                    await client.save();
-                    logger.info(`클라이언트 ${name}의 목표 수익금이 ${targetProfit} USDT로 설정되었습니다.`);
-
-                    // 대시보드에 목표 수익금 업데이트 전송
-                    io.emit('update_target_profit', { name: name, targetProfit: targetProfit });
-
-                    // 콜백으로 성공 응답 전송
-                    if (callback && typeof callback === 'function') {
-                        callback({ status: 'success' });
-                    }
-                } else {
-                    logger.warn(`set_target_profit: 클라이언트 ${name}을(를) 찾을 수 없습니다.`);
-                    if (callback && typeof callback === 'function') {
-                        callback({ status: 'error', message: `클라이언트 ${name}을(를) 찾을 수 없습니다.` });
-                    }
-                }
-            } else {
-                logger.warn(`set_target_profit: 잘못된 목표 수익금 데이터 수신: ${JSON.stringify(data)}`);
-                if (callback && typeof callback === 'function') {
-                    callback({ status: 'error', message: 'Invalid targetProfit value.' });
-                }
-            }
-        } catch (error) {
-            logger.error('set_target_profit 처리 중 오류:', error);
-            if (callback && typeof callback === 'function') {
-                callback({ status: 'error', message: '목표 수익금 설정 중 오류가 발생했습니다.' });
-            }
-        }
-    });
-
-    // 'keep_alive' 이벤트 처리
-    socket.on('keep_alive', (data) => {
-        try {
-            logger.info(`keep_alive 이벤트 수신: ${JSON.stringify(data)}`);
-            // 필요한 경우 추가 처리
-        } catch (error) {
-            logger.error('keep_alive 처리 중 오류:', error);
-        }
-    });
-
-    // 'update_data' 이벤트 처리
-    socket.on('update_data', async (data) => {
-        logger.info(`update_data 이벤트 수신: ${JSON.stringify(data)}`);
-        try {
-            if (!data.name) {
-                socket.emit('error', { message: '데이터에 사용자 이름이 포함되어 있지 않습니다.' });
-                logger.warn('update_data: 사용자 이름 누락');
-                return;
-            }
-
-            let client = await Client.findOne({ username: data.name });
-
-            if (client) {
-                // 데이터베이스 업데이트
-                client.total_balance = typeof data.total_balance === 'number' ? data.total_balance : client.total_balance;
-                client.current_profit_rate = typeof data.current_profit_rate === 'number' ? data.current_profit_rate : client.current_profit_rate;
-                client.unrealized_pnl = typeof data.unrealized_pnl === 'number' ? data.unrealized_pnl : client.unrealized_pnl;
-                client.current_total_asset = typeof data.current_total_asset === 'number' ? data.current_total_asset : client.current_total_asset;
-                // server_status는 'Connected'로 유지해야 합니다.
-                if (data.server_status) {
-                    client.server_status = data.server_status;
-                }
-                client.timestamp = new Date();
-                await client.save();
-
-                // 메모리의 클라이언트 정보도 업데이트
-                clients[client.username] = {
-                    ...client._doc,
-                    socket: socket
-                };
-            } else {
-                // 클라이언트 정보가 없으면 생성
-                client = new Client({
-                    username: data.name,
-                    address: data.user_ip,
-                    server_status: data.server_status,
-                    socketId: socket.id,
-                    isApproved: false, // 초기 승인 상태는 false
-                    cumulativeProfit: 0, // 초기 누적 수익금은 0
-                    targetProfit: 500, // 초기 목표 수익금은 500
-                    goalAchieved: false // 초기 목표 달성 상태는 false
-                });
-                await client.save();
-
-                // 메모리에 저장
-                clients[client.username] = {
-                    ...client._doc,
-                    socket: socket
-                };
-            }
-
-            // 소수점 두 자리로 반올림
-            const roundedData = { ...data };
-            const numericFields = ['total_balance', 'current_profit_rate', 'unrealized_pnl', 'current_total_asset'];
-
-            numericFields.forEach(field => {
-                if (typeof roundedData[field] === 'number') {
-                    roundedData[field] = parseFloat(roundedData[field].toFixed(2));
-                } else {
-                    roundedData[field] = null;  // 데이터가 없을 경우 null로 설정
-                }
+            const tradeResult = await tradeManager.recordTrade({
+                username: data.name,
+                type: data.type,
+                symbol: data.symbol,
+                amount: data.amount,
+                price: data.price,
+                profit: data.profit
             });
 
-            // 'target_profit'을 제외하고 브로드캐스트
-            delete roundedData.target_profit;
+            if (tradeResult.goalAchieved) {
+                io.emit('goal_achieved', {
+                    name: tradeResult.username
+                });
+            }
 
-            // 모든 클라이언트에게 데이터 브로드캐스트
-            io.emit('update_data', roundedData);
+            io.emit('trade_update', {
+                username: data.name,
+                trade: {
+                    type: data.type,
+                    symbol: data.symbol,
+                    price: data.price,
+                    amount: data.amount,
+                    profit: data.profit,
+                    timestamp: new Date()
+                }
+            });
         } catch (error) {
-            logger.error('update_data 처리 중 오류:', error);
-            socket.emit('error', { message: '데이터 업데이트 중 오류가 발생했습니다.' });
+            logger.error('거래 실행 처리 오류:', error);
+            socket.emit('error', { message: '거래 처리 중 오류가 발생했습니다.' });
         }
     });
 
-    // 클라이언트로부터 승인 또는 승인취소 명령을 수신
+    socket.on('update_data', async (data) => {
+        try {
+            if (!data.name) {
+                socket.emit('error', { message: '사용자 이름이 누락되었습니다.' });
+                return;
+            }
+    
+            const client = await Client.findOneAndUpdate(
+                { username: data.name },
+                {
+                    $set: {
+                        lastActive: new Date(),
+                        total_balance: data.total_balance,
+                        current_profit_rate: data.current_profit_rate,
+                        unrealized_pnl: data.unrealized_pnl,
+                        current_total_asset: data.current_total_asset,
+                        server_status: data.server_status || 'Connected',
+                        cumulativeProfit: data.cumulative_profit // 실현 누적 이익 DB 반영
+                    }
+                },
+                { new: true }
+            );
+    
+            if (client) {
+                // 실현 누적 이익 + 미실현 손익 합산
+                const realizedProfit = client.cumulativeProfit || 0;
+                const unrealized = parseFloat(data.unrealized_pnl) || 0;
+                const displayProfit = realizedProfit + unrealized;
+    
+                const broadcastData = {
+                    name: client.username,
+                    total_balance: Number(data.total_balance).toFixed(2),
+                    current_profit_rate: Number(data.current_profit_rate).toFixed(2),
+                    unrealized_pnl: Number(data.unrealized_pnl).toFixed(2),
+                    current_total_asset: Number(data.current_total_asset).toFixed(2),
+                    server_status: client.server_status,
+                    timestamp: new Date().toISOString(),
+                    cumulative_profit: realizedProfit,    // 기존 실현 이익
+                    display_profit: displayProfit.toFixed(2) // 실현 + 미실현 이익 합산한 값
+                };
+    
+                io.emit('update_data', broadcastData);
+            }
+        } catch (error) {
+            logger.error('데이터 업데이트 오류:', error);
+            socket.emit('error', { message: '데이터 업데이트 중 오류가 발생했습니다.' });
+        }
+    });    
+
     socket.on('send_command', async (data) => {
-        logger.info(`send_command 이벤트 수신: ${JSON.stringify(data)}`);
         try {
             const { command, name } = data;
             if (!command || !name) {
                 socket.emit('error', { message: '명령 또는 사용자 이름이 누락되었습니다.' });
-                logger.warn('send_command: 명령 또는 사용자 이름 누락');
                 return;
             }
 
-            // 데이터베이스에서 해당 클라이언트를 찾습니다.
             const client = await Client.findOne({ username: name });
-
             if (client) {
-                // 승인 상태 업데이트
+                client.lastActive = new Date();
                 if (command === 'approve') {
                     client.isApproved = true;
                 } else if (command === 'cancel_approve') {
                     client.isApproved = false;
-                    // 목표 달성 상태 리셋
                     client.goalAchieved = false;
-                } else {
-                    socket.emit('error', { message: '알 수 없는 명령입니다.' });
-                    logger.warn(`send_command: 알 수 없는 명령 - ${command}`);
-                    return;
                 }
                 await client.save();
 
-                // 메모리의 클라이언트 정보도 업데이트
-                if (clients[client.username]) {
-                    clients[client.username].isApproved = client.isApproved;
-                }
-
-                // 해당 클라이언트에게 명령 전송
                 if (client.socketId) {
-                    io.to(client.socketId).emit(command, { message: `${command} 명령이 서버에서 전송되었습니다.` });
-                    logger.info(`클라이언트 ${name}에게 ${command} 명령을 전송했습니다.`);
+                    io.to(client.socketId).emit(command, {
+                        message: `${command} 명령이 전송되었습니다.`
+                    });
                 }
 
-                // 모든 클라이언트에게 승인 상태 업데이트 전송
-                io.emit('update_approval_status', { name: client.username, isApproved: client.isApproved });
-            } else {
-                logger.warn(`send_command: 클라이언트 ${name}을(를) 찾을 수 없습니다.`);
-                socket.emit('error', { message: `클라이언트 ${name}을(를) 찾을 수 없습니다.` });
+                io.emit('update_approval_status', {
+                    name: client.username,
+                    isApproved: client.isApproved
+                });
             }
         } catch (error) {
-            logger.error('send_command 처리 중 오류:', error);
-            socket.emit('error', { message: '명령 전송 중 오류가 발생했습니다.' });
+            logger.error('명령 처리 오류:', error);
+            socket.emit('error', { message: '명령 처리 중 오류가 발생했습니다.' });
         }
     });
 
-    // 클라이언트 연결 해제 시
-    socket.on('disconnect', async () => {
-        logger.info(`클라이언트 연결 해제됨. Socket ID: ${socket.id}`);
+    socket.on('set_target_profit', async (data) => {
         try {
+            const { name, targetProfit } = data;
+            if (typeof targetProfit !== 'number' || targetProfit <= 0) {
+                socket.emit('error', { message: '잘못된 목표 수익 값입니다.' });
+                return;
+            }
+
+            await Client.findOneAndUpdate(
+                { username: name },
+                {
+                    $set: {
+                        targetProfit,
+                        lastActive: new Date()
+                    }
+                }
+            );
+
+            io.emit('update_target_profit', {
+                name,
+                targetProfit
+            });
+        } catch (error) {
+            logger.error('목표 수익 설정 오류:', error);
+            socket.emit('error', { message: '목표 수익 설정 중 오류가 발생했습니다.' });
+        }
+    });
+
+    socket.on('request_reports', async (data) => {
+        try {
+            const { username, startDate, endDate } = data;
+            const trades = await tradeManager.getTradeHistory(username, startDate, endDate);
+
+            socket.emit('reports_data', {
+                trades,
+                statistics: calculateStatistics(trades)
+            });
+        } catch (error) {
+            logger.error('보고서 데이터 조회 오류:', error);
+            socket.emit('error', { message: '보고서 데이터 조회 중 오류가 발생했습니다.' });
+        }
+    });
+
+    socket.on('disconnect', async () => {
+        try {
+            clearInterval(heartbeat);
             const client = await Client.findOne({ socketId: socket.id });
             if (client) {
                 client.server_status = 'Disconnected';
+                client.socketId = null;
+                client.lastActive = new Date();
+                client.connectionHistory.push({
+                    status: 'Disconnected',
+                    timestamp: new Date(),
+                    disconnectReason: 'Client disconnected'
+                });
                 await client.save();
 
-                // 메모리에서 클라이언트 정보 삭제
-                delete clients[client.username];
-
-                // 웹페이지에 사용자 상태 업데이트
-                const disconnectData = {
+                io.emit('update_user_info', {
                     name: client.username,
                     user_ip: client.address,
                     server_status: 'Disconnected',
-                    timestamp: new Date().toISOString().slice(0, 19).replace('T', ' ')
-                };
-                io.emit('update_user_info', disconnectData);
-                logger.info(`클라이언트 ${client.username}의 상태를 'Disconnected'로 업데이트`);
+                    timestamp: new Date().toISOString(),
+                    cumulative_profit: client.cumulativeProfit || 0
+                });
             }
-        } catch (error) {
-            logger.error('disconnect 처리 중 오류:', error);
-        }
-    });
 
-    // 'request_initial_data' 이벤트 처리
-    socket.on('request_initial_data', async () => {
-        logger.info('request_initial_data 이벤트 수신');
-        try {
-            // 데이터베이스에서 모든 클라이언트 데이터를 가져옵니다.
-            const allClients = await Client.find({});
-            const allUserData = allClients.map(client => ({
-                name: client.username,
-                user_ip: client.address,
-                total_balance: typeof client.total_balance === 'number' ? client.total_balance : 0,
-                current_profit_rate: typeof client.current_profit_rate === 'number' ? client.current_profit_rate : 0,
-                unrealized_pnl: typeof client.unrealized_pnl === 'number' ? client.unrealized_pnl : 0,
-                current_total_asset: typeof client.current_total_asset === 'number' ? client.current_total_asset : 0,
-                cumulative_profit: client.cumulativeProfit,
-                target_profit: client.targetProfit,
-                server_status: client.server_status,
-                isApproved: client.isApproved,
-                timestamp: client.timestamp ? client.timestamp.toISOString().slice(0, 19).replace('T', ' ') : ''
-            }));
-
-            socket.emit('initial_data', allUserData);
-            logger.info('initial_data 이벤트 전송 완료');
+            connectionManager.removeConnection(socket.id);
+            logger.info(`클라이언트 연결 해제: ${socket.id}`);
         } catch (error) {
-            logger.error('request_initial_data 처리 중 오류:', error);
-            socket.emit('error', { message: '초기 데이터 요청 처리 중 오류가 발생했습니다.' });
+            logger.error('연결 해제 처리 오류:', error);
         }
     });
 });
 
-// 서버 시작
+function calculateStatistics(trades) {
+    if (!trades.length) {
+        return {
+            totalTrades: 0,
+            totalProfit: 0,
+            winRate: 0,
+            averageProfit: 0,
+            bestTrade: 0,
+            worstTrade: 0
+        };
+    }
+
+    const winningTrades = trades.filter(trade => trade.profit > 0);
+    const totalProfit = trades.reduce((sum, trade) => sum + trade.profit, 0);
+
+    return {
+        totalTrades: trades.length,
+        totalProfit: Number(totalProfit.toFixed(2)),
+        winRate: Number((winningTrades.length / trades.length * 100).toFixed(2)),
+        averageProfit: Number((totalProfit / trades.length).toFixed(2)),
+        bestTrade: Number(Math.max(...trades.map(t => t.profit)).toFixed(2)),
+        worstTrade: Number(Math.min(...trades.map(t => t.profit)).toFixed(2))
+    };
+}
+
+// 에러 핸들링 미들웨어
+app.use((err, req, res, next) => {
+    logger.error('예상치 못한 오류:', err);
+    res.status(500).json({
+        success: false,
+        error: '서버 오류가 발생했습니다.'
+    });
+});
+
+process.on('uncaughtException', (error) => {
+    logger.error('Uncaught Exception:', error);
+    setTimeout(() => {
+        process.exit(1);
+    }, 1000);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    logger.error('Unhandled Rejection:', reason);
+});
+
+// 정상 종료 처리
+async function gracefulShutdown() {
+    logger.info('서버 종료 시작...');
+    const activeConnections = connectionManager.getAllConnections();
+    for (const [socketId, connection] of activeConnections) {
+        try {
+            const socket = io.sockets.sockets.get(socketId);
+            if (socket) {
+                socket.disconnect(true);
+            }
+        } catch (error) {
+            logger.error(`소켓 연결 종료 중 오류 (${socketId}):`, error);
+        }
+    }
+
+    try {
+        await mongoose.connection.close();
+        logger.info('MongoDB 연결 종료');
+    } catch (error) {
+        logger.error('MongoDB 연결 종료 오류:', error);
+    }
+
+    server.close(() => {
+        logger.info('서버가 안전하게 종료되었습니다.');
+        process.exit(0);
+    });
+
+    setTimeout(() => {
+        logger.error('서버 강제 종료');
+        process.exit(1);
+    }, 10000);
+}
+
+process.on('SIGTERM', gracefulShutdown);
+process.on('SIGINT', gracefulShutdown);
+
+const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
     logger.info(`서버가 포트 ${PORT}에서 실행 중입니다.`);
 });
+
+// 주기적인 연결 상태 모니터링 (5분마다)
+setInterval(() => {
+    const activeConnections = connectionManager.getAllConnections();
+    logger.info(`활성 연결 수: ${activeConnections.length}`);
+}, 300000);
+
+// 메모리 사용량 모니터링 (15분마다)
+setInterval(() => {
+    const used = process.memoryUsage();
+    logger.info('메모리 사용량:', {
+        rss: `${Math.round(used.rss / 1024 / 1024)} MB`,
+        heapTotal: `${Math.round(used.heapTotal / 1024 / 1024)} MB`,
+        heapUsed: `${Math.round(used.heapUsed / 1024 / 1024)} MB`,
+        external: `${Math.round(used.external / 1024 / 1024)} MB`
+    });
+}, 900000);

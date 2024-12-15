@@ -14,9 +14,6 @@ const { createLogger, format, transports } = winston;
 require('winston-daily-rotate-file');
 const compression = require('compression');
 
-// 데이터베이스 관련 코드 제거
-// const db = require('./db'); // 삭제
-
 // 로깅 설정 (DailyRotateFile 사용)
 const logTransport = new transports.DailyRotateFile({
     filename: 'app-%DATE%.log',
@@ -130,23 +127,9 @@ app.get('/dashboard', isAuthenticated, (req, res) => {
 });
 
 // 메모리에 사용자 상태 저장할 객체
-// username을 key로 하여 {
-//   name: string,
-//   user_ip: string,
-//   total_balance: number,
-//   current_profit_rate: number,
-//   unrealized_pnl: number,
-//   current_total_asset: number,
-//   server_status: string,
-//   timestamp: string,
-//   cumulative_profit: number,
-//   target_profit: number,
-//   isApproved: boolean
-// } 형태로 저장
 const usersData = {};
 
-// Socket.IO 이벤트 처리
-io.on('connection', async (socket) => {
+io.on('connection', (socket) => {
     logger.info(`새로운 클라이언트 연결: ${socket.id}`);
 
     const heartbeat = setInterval(() => {
@@ -157,13 +140,11 @@ io.on('connection', async (socket) => {
 
     socket.on('heartbeat-response', async () => {
         // 클라이언트 생존신호 처리
-        // DB 제거로 인한 별도 처리 없음
     });
 
     // 초기 데이터 요청
     socket.on('request_initial_data', async () => {
         try {
-            // usersData에 있는 모든 사용자 정보를 배열로 변환
             const allUserData = Object.values(usersData).map(user => ({
                 name: user.name,
                 user_ip: user.user_ip,
@@ -175,9 +156,9 @@ io.on('connection', async (socket) => {
                 timestamp: user.timestamp || new Date().toISOString(),
                 cumulative_profit: user.cumulative_profit || 0,
                 target_profit: user.target_profit || 500,
-                isApproved: user.isApproved || false
+                isApproved: user.isApproved || false,
+                display_profit: user.display_profit || 0
             }));
-
             socket.emit('initial_data', allUserData);
         } catch (error) {
             logger.error('초기 데이터 전송 오류:', error);
@@ -193,10 +174,12 @@ io.on('connection', async (socket) => {
                 return;
             }
 
-            // DB 사용 안 하므로 메모리에 저장
             if (!usersData[data.name]) {
                 usersData[data.name] = {};
             }
+
+            // 사용자와 socketId 매핑
+            usersData[data.name].socketId = socket.id;
 
             usersData[data.name] = {
                 ...usersData[data.name],
@@ -204,7 +187,6 @@ io.on('connection', async (socket) => {
                 user_ip: data.user_ip,
                 server_status: data.server_status,
                 timestamp: data.timestamp || new Date().toISOString(),
-                // isApproved나 target_profit는 update_data에서 받을 수도 있고 이 이벤트에서 받을 수도 있음
                 isApproved: (data.isApproved !== undefined) ? data.isApproved : (usersData[data.name].isApproved || false),
                 target_profit: (data.target_profit !== undefined) ? data.target_profit : (usersData[data.name].target_profit || 500),
                 display_profit: data.display_profit != null ? data.display_profit : (usersData[data.name].display_profit || 0),
@@ -218,12 +200,10 @@ io.on('connection', async (socket) => {
         }
     });
 
-    // 거래 실행 처리 (예제용: 실사용은 필요없을 수 있음)
+    // 거래 실행 처리 (예제용)
     socket.on('trade_executed', async (data) => {
         try {
-            // DB 제거, 여기서는 단순히 로그만
             logger.info(`거래 실행 데이터: ${JSON.stringify(data)}`);
-            // 목표 달성 여부는 이제 처리하지 않음
         } catch (error) {
             logger.error('거래 실행 처리 오류:', error);
             socket.emit('error', { message: '거래 처리 중 오류가 발생했습니다.' });
@@ -241,6 +221,9 @@ io.on('connection', async (socket) => {
             if (!usersData[data.name]) {
                 usersData[data.name] = {};
             }
+
+            // 사용자와 socketId 매핑 (update_data 때도 매핑 갱신)
+            usersData[data.name].socketId = socket.id;
 
             usersData[data.name] = {
                 ...usersData[data.name],
@@ -275,16 +258,22 @@ io.on('connection', async (socket) => {
                 return;
             }
 
-            // 여기서는 DB 없이 바로 해당 사용자에게 이벤트 전송
-            // isApproved 상태는 사용자가 알아서 로컬에 저장
+            const user = usersData[name];
+            if (!user || !user.socketId) {
+                socket.emit('error', { message: '해당 사용자를 찾을 수 없습니다.' });
+                return;
+            }
+
             if (command === 'approve') {
-                io.emit('approve', { name: name });
+                // 해당 사용자에게만 approve 이벤트 전송
+                io.to(user.socketId).emit('approve', { name: name });
                 io.emit('update_approval_status', {
                     name: name,
                     isApproved: true
                 });
             } else if (command === 'cancel_approve') {
-                io.emit('cancel_approve', { name: name });
+                // 해당 사용자에게만 cancel_approve 이벤트 전송
+                io.to(user.socketId).emit('cancel_approve', { name: name });
                 io.emit('update_approval_status', {
                     name: name,
                     isApproved: false
@@ -296,41 +285,10 @@ io.on('connection', async (socket) => {
         }
     });
 
-    // 목표 수익금 설정
-    socket.on('set_target_profit', async (data) => {
-        try {
-            const { name, targetProfit } = data;
-            if (typeof targetProfit !== 'number' || targetProfit <= 0) {
-                socket.emit('error', { message: '잘못된 목표 수익 값입니다.' });
-                return;
-            }
-
-            // 사용자가 로컬 JSON에 저장하므로 여기선 단순히 이벤트만 중계
-            io.emit('set_target_profit', {
-                name,
-                targetProfit
-            });
-
-            // 메모리에도 반영 (사용자가 이후 업데이트 시 다시 반영 가능)
-            if (!usersData[name]) {
-                usersData[name] = {};
-            }
-            usersData[name].target_profit = targetProfit;
-            logger.info(`목표 수익금 설정: ${name} - ${targetProfit} USDT`);
-
-            // 변경된 사용자 데이터 다시 브로드캐스트
-            io.emit('update_data', usersData[name]);
-        } catch (error) {
-            logger.error('목표 수익 설정 오류:', error);
-            socket.emit('error', { message: '목표 수익 설정 중 오류가 발생했습니다.' });
-        }
-    });
-
-    // 보고서 요청 처리 (DB 제거로 인하여 단순히 빈 데이터 반환)
+    // 보고서 요청 처리 (DB없으므로 빈 값 반환)
     socket.on('request_reports', async (data) => {
         try {
             const { username, startDate, endDate } = data;
-            // DB 미사용 -> 빈 값 반환
             socket.emit('reports_data', {
                 trades: [],
                 statistics: {
@@ -348,13 +306,11 @@ io.on('connection', async (socket) => {
         }
     });
 
-    // 연결 해제 처리
     socket.on('disconnect', async () => {
         try {
             clearInterval(heartbeat);
-            // socketId로 사용자 식별 불가하므로 여기서는 별도 처리 없음
-            // 실제로는 사용자별 socketId 매핑을 관리해 'Disconnected' 상태로 업데이트할 수 있음
             logger.info(`클라이언트 연결 해제: ${socket.id}`);
+            // 필요하다면 usersData에서 socketId가 해당 소켓인 사용자 상태를 Disconnected로 변경할 수 있음
         } catch (error) {
             logger.error('연결 해제 처리 오류:', error);
         }
@@ -385,7 +341,6 @@ process.on('unhandledRejection', (reason, promise) => {
 // 정상 종료 처리
 async function gracefulShutdown() {
     logger.info('서버 종료 시작...');
-    // 메모리 정리 (특별히 할 것은 없음)
     server.close(() => {
         logger.info('서버가 안전하게 종료되었습니다.');
         process.exit(0);

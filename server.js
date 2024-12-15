@@ -40,7 +40,7 @@ const logger = createLogger({
 
 const app = express();
 app.use(cors({
-    origin: "http://localhost:5000", // 실제 도메인으로 변경
+    origin: "https://port-0-sinaid-server-m1onak5031836227.sel4.cloudtype.app", // 실제 도메인으로 변경
     methods: ["GET", "POST"],
     credentials: true
 }));
@@ -64,7 +64,7 @@ app.use(session({
 const server = http.createServer(app);
 const io = socketIo(server, {
     cors: {
-        origin: "http://localhost:5000", // 실제 도메인으로 변경
+        origin: "https://port-0-sinaid-server-m1onak5031836227.sel4.cloudtype.app", // 실제 도메인으로 변경
         methods: ["GET", "POST"],
         credentials: true
     },

@@ -53,7 +53,7 @@ app.use(session({
     resave: false,
     saveUninitialized: false,
     cookie: {
-        secure: false, // HTTPS 사용 시 true로 설정
+        secure: true, // HTTPS 사용 시 true로 설정
         httpOnly: true,
         maxAge: 60 * 60 * 1000 // 1시간
     }

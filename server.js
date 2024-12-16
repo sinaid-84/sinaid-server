@@ -308,6 +308,30 @@ io.on('connection', (socket) => {
         }
     });
 
+    // 목표 수익금 설정
+    socket.on('set_target_profit', async (data) => {
+        try {
+            const { name, targetProfit } = data;
+            const userData = usersData.get(name);
+            
+            if (userData && userData.socketId) {
+                // 해당 클라이언트에게만 설정 변경 이벤트 전송
+                io.to(userData.socketId).emit('set_target_profit', {
+                    targetProfit: targetProfit
+                });
+                
+                // 모든 클라이언트에게 업데이트 알림
+                io.emit('update_data', {
+                    ...userData,
+                    target_profit: targetProfit
+                });
+            }
+        } catch (error) {
+            logger.error('목표 수익금 설정 오류:', error);
+            socket.emit('error', { message: '목표 수익금 설정 중 오류가 발생했습니다.' });
+        }
+    });
+
     // 연결 해제 처리
     socket.on('disconnect', async () => {
         try {

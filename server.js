@@ -2,6 +2,7 @@
 require('dotenv').config();
 const cluster = require('cluster');
 const os = require('os');
+const sticky = require('sticky-session');
 
 const express = require('express');
 const http = require('http');
@@ -17,64 +18,116 @@ const { createLogger, format, transports } = winston;
 require('winston-daily-rotate-file');
 const compression = require('compression');
 
-if (cluster.isMaster) {
-    // 마스터 프로세스: CPU 코어 수 만큼 워커 생성
-    const numCPUs = os.cpus().length;
-    console.log(`마스터 프로세스 PID: ${process.pid}, 워커 수: ${numCPUs}`);
-    for (let i = 0; i < numCPUs; i++) {
-        cluster.fork();
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "xorhkd12!@";
+
+// 클러스터 환경 설정
+const numCPUs = os.cpus().length;
+
+// 마스터나 워커 구분 없이 하나의 코드 블록에서 sticky-session을 사용
+// sticky(...) 호출 시 마스터는 리스닝 소켓을 열고, 워커에게 소켓을 분배
+// 각 워커는 동일한 코드 실행
+if (!cluster.isMaster) {
+    // 워커 환경
+}
+
+const logTransport = new transports.DailyRotateFile({
+    filename: 'app-%DATE%.log',
+    dirname: 'logs',
+    datePattern: 'YYYY-MM-DD',
+    maxSize: '20m',
+    maxFiles: '14d'
+});
+
+const logger = createLogger({
+    level: 'info',
+    format: format.combine(
+        format.timestamp(),
+        format.json()
+    ),
+    transports: [
+        logTransport,
+        new transports.Console({ format: format.simple() })
+    ]
+});
+
+const app = express();
+app.use(cors({
+    origin: "https://port-0-sinaid-server-m1onak5031836227.sel4.cloudtype.app", // 실제 도메인으로 변경
+    methods: ["GET", "POST"],
+    credentials: true
+}));
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
+app.use(express.static(path.join(__dirname, 'public')));
+app.use(compression());
+
+// 세션 설정 (MemoryStore 사용)
+app.use(session({
+    secret: process.env.SESSION_SECRET || 'your_secret_key',
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+        secure: false, // HTTPS 사용 시 true로 설정
+        httpOnly: true,
+        maxAge: 60 * 60 * 1000 // 1시간
     }
+}));
 
-    cluster.on('exit', (worker, code, signal) => {
-        console.log(`워커 ${worker.process.pid} 종료, 코드: ${code}, 신호: ${signal}`);
-        // 필요시 죽은 워커 다시 생성
-        cluster.fork();
-    });
-} else {
-    // 워커 프로세스: 실제 서버 로직 실행
-    const logTransport = new transports.DailyRotateFile({
-        filename: 'app-%DATE%.log',
-        dirname: 'logs',
-        datePattern: 'YYYY-MM-DD',
-        maxSize: '20m',
-        maxFiles: '14d'
-    });
+function isAuthenticated(req, res, next) {
+    if (req.session.isAuthenticated) {
+        next();
+    } else {
+        res.redirect('/login');
+    }
+}
 
-    const logger = createLogger({
-        level: 'info',
-        format: format.combine(
-            format.timestamp(),
-            format.json()
-        ),
-        transports: [
-            logTransport,
-            new transports.Console({ format: format.simple() })
-        ]
-    });
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
 
-    const app = express();
-    app.use(cors({
-        origin: "https://port-0-sinaid-server-m1onak5031836227.sel4.cloudtype.app", // 실제 도메인으로 변경
-        methods: ["GET", "POST"],
-        credentials: true
-    }));
-    app.use(bodyParser.json());
-    app.use(bodyParser.urlencoded({ extended: true }));
-    app.use(express.static(path.join(__dirname, 'public')));
-    app.use(compression());
+app.get('/login', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'login.html'));
+});
 
-    // 세션 설정 (MemoryStore 사용)
-    app.use(session({
-        secret: process.env.SESSION_SECRET || 'your_secret_key',
-        resave: false,
-        saveUninitialized: false,
-        cookie: {
-            secure: false, // HTTPS 사용 시 true로 설정
-            httpOnly: true,
-            maxAge: 60 * 60 * 1000 // 1시간
+app.post('/login', (req, res) => {
+    const { password } = req.body;
+    logger.info('로그인 시도');
+
+    const hashedPassword = bcrypt.hashSync(ADMIN_PASSWORD, 10);
+    if (bcrypt.compareSync(password, hashedPassword)) {
+        req.session.isAuthenticated = true;
+        logger.info('로그인 성공');
+        res.redirect('/dashboard');
+    } else {
+        logger.warn('로그인 실패: 잘못된 비밀번호');
+        res.send(`
+            <script>
+                alert('비밀번호가 일치하지 않습니다.');
+                window.location.href = '/login';
+            </script>
+        `);
+    }
+});
+
+app.get('/logout', (req, res) => {
+    req.session.destroy((err) => {
+        if (err) {
+            logger.error('로그아웃 중 오류:', err);
+            return res.redirect('/dashboard');
         }
-    }));
+        logger.info('로그아웃 성공');
+        res.redirect('/');
+    });
+});
 
+app.get('/dashboard', isAuthenticated, (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'dashboard.html'));
+});
+
+// 메모리에 사용자 상태 저장할 객체 (각 워커별 독립)
+const usersData = {};
+
+function startServer() {
     const server = http.createServer(app);
     const io = socketIo(server, {
         cors: {
@@ -86,62 +139,6 @@ if (cluster.isMaster) {
         pingInterval: 25000,
         maxHttpBufferSize: 1e6
     });
-
-    const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "xorhkd12!@";
-    const hashedPassword = bcrypt.hashSync(ADMIN_PASSWORD, 10);
-
-    function isAuthenticated(req, res, next) {
-        if (req.session.isAuthenticated) {
-            next();
-        } else {
-            res.redirect('/login');
-        }
-    }
-
-    app.get('/', (req, res) => {
-        res.sendFile(path.join(__dirname, 'public', 'index.html'));
-    });
-
-    app.get('/login', (req, res) => {
-        res.sendFile(path.join(__dirname, 'public', 'login.html'));
-    });
-
-    app.post('/login', (req, res) => {
-        const { password } = req.body;
-        logger.info('로그인 시도');
-
-        if (bcrypt.compareSync(password, hashedPassword)) {
-            req.session.isAuthenticated = true;
-            logger.info('로그인 성공');
-            res.redirect('/dashboard');
-        } else {
-            logger.warn('로그인 실패: 잘못된 비밀번호');
-            res.send(`
-                <script>
-                    alert('비밀번호가 일치하지 않습니다.');
-                    window.location.href = '/login';
-                </script>
-            `);
-        }
-    });
-
-    app.get('/logout', (req, res) => {
-        req.session.destroy((err) => {
-            if (err) {
-                logger.error('로그아웃 중 오류:', err);
-                return res.redirect('/dashboard');
-            }
-            logger.info('로그아웃 성공');
-            res.redirect('/');
-        });
-    });
-
-    app.get('/dashboard', isAuthenticated, (req, res) => {
-        res.sendFile(path.join(__dirname, 'public', 'dashboard.html'));
-    });
-
-    // 메모리에 사용자 상태 저장할 객체 (워커별로 독립)
-    const usersData = {};
 
     io.on('connection', (socket) => {
         logger.info(`새로운 클라이언트 연결(워커PID:${process.pid}): ${socket.id}`);
@@ -355,22 +352,31 @@ if (cluster.isMaster) {
     process.on('SIGINT', gracefulShutdown);
 
     const PORT = process.env.PORT || 5000;
-    server.listen(PORT, () => {
+
+    // sticky-session을 통해 마스터/워커 모드로 서버 시작
+    if (!sticky.listen(server, PORT)) {
+        // 마스터 프로세스
+        console.log(`마스터 프로세스 PID ${process.pid}, ${numCPUs} workers`);
+    } else {
+        // 워커 프로세스
         logger.info(`워커 PID:${process.pid}, 포트 ${PORT}에서 실행 중입니다.`);
-    });
 
-    setInterval(() => {
-        const activeCount = Object.keys(io.sockets.sockets).length;
-        logger.info(`(워커PID:${process.pid}) 활성 연결 수: ${activeCount}`);
-    }, 300000);
+        setInterval(() => {
+            const activeCount = Object.keys(io.sockets.sockets).length;
+            logger.info(`(워커PID:${process.pid}) 활성 연결 수: ${activeCount}`);
+        }, 300000);
 
-    setInterval(() => {
-        const used = process.memoryUsage();
-        logger.info('(워커PID:' + process.pid + ') 메모리 사용량:', {
-            rss: `${Math.round(used.rss / 1024 / 1024)} MB`,
-            heapTotal: `${Math.round(used.heapTotal / 1024 / 1024)} MB`,
-            heapUsed: `${Math.round(used.heapUsed / 1024 / 1024)} MB`,
-            external: `${Math.round(used.external / 1024 / 1024)} MB`
-        });
-    }, 900000);
+        setInterval(() => {
+            const used = process.memoryUsage();
+            logger.info('(워커PID:' + process.pid + ') 메모리 사용량:', {
+                rss: `${Math.round(used.rss / 1024 / 1024)} MB`,
+                heapTotal: `${Math.round(used.heapTotal / 1024 / 1024)} MB`,
+                heapUsed: `${Math.round(used.heapUsed / 1024 / 1024)} MB`,
+                external: `${Math.round(used.external / 1024 / 1024)} MB`
+            });
+        }, 900000);
+    }
 }
+
+// 서버 시작 함수 호출
+startServer();

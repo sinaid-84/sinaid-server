@@ -19,7 +19,7 @@ const logTransport = new transports.DailyRotateFile({
     dirname: 'logs',
     datePattern: 'YYYY-MM-DD-HH',  // 시간단위로 파일 생성
     maxSize: '10m',
-    maxFiles: '1h',        // 1시간 지난 로그 삭제
+    maxFiles: '30m',        // 1시간 지난 로그 삭제
     tailable: true,
     zippedArchive: false   // 1시간만 보관하므로 압축 불필요
 });

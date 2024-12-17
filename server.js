@@ -17,11 +17,9 @@ const compression = require('compression');
 const logTransport = new transports.DailyRotateFile({
     filename: 'app-%DATE%.log',
     dirname: 'logs',
-    datePattern: 'YYYY-MM-DD-HH',  // 시간단위로 파일 생성
-    maxSize: '10m',
-    maxFiles: '30m',        // 1시간 지난 로그 삭제
-    tailable: true,
-    zippedArchive: false   // 1시간만 보관하므로 압축 불필요
+    datePattern: 'YYYY-MM-DD',
+    maxSize: '20m',
+    maxFiles: '14d'
 });
 
 const logger = createLogger({
@@ -155,192 +153,201 @@ app.get('/dashboard', isAuthenticated, (req, res) => {
 io.on('connection', (socket) => {
     logger.info(`새로운 클라이언트 연결: ${socket.id}`);
     
+    // 연결 시 이전 리스너 정리
+    socket.removeAllListeners();
+    
     // 하트비트 설정
     const heartbeat = setInterval(() => {
         if (socket.connected) {
             socket.emit('heartbeat');
         }
     }, 20000);
-
-    socket.on('heartbeat-response', async () => {
-        // 클라이언트 생존신호 처리
-    });
-
-    // 초기 데이터 요청 처리
-    socket.on('request_initial_data', async () => {
-        try {
-            const allUserData = Array.from(usersData.values()).map(user => ({
-                name: user.name,
-                user_ip: user.user_ip,
-                total_balance: user.total_balance || 0,
-                current_profit_rate: user.current_profit_rate || 0,
-                unrealized_pnl: user.unrealized_pnl || 0,
-                current_total_asset: user.current_total_asset || 0,
-                server_status: user.server_status || 'Disconnected',
-                timestamp: user.timestamp || new Date().toISOString(),
-                cumulative_profit: user.cumulative_profit || 0,
-                target_profit: user.target_profit || 500,
-                isApproved: user.isApproved || false,
-                display_profit: user.display_profit || 0
-            }));
-            socket.emit('initial_data', allUserData);
-        } catch (error) {
-            logger.error('초기 데이터 전송 오류:', error);
-            socket.emit('error', { message: '초기 데이터 전송 중 오류가 발생했습니다.' });
-        }
-    });
-
-    // 사용자 정보 업데이트
-    socket.on('user_info_update', async (data) => {
-        try {
-            if (!data.name || !data.user_ip || !data.server_status) {
-                socket.emit('error', { message: '잘못된 사용자 정보 데이터입니다.' });
-                return;
+ 
+    // 모든 이벤트 리스너를 등록하는 함수
+    const registerListeners = () => {
+        socket.on('heartbeat-response', async () => {
+            // 클라이언트 생존신호 처리
+        });
+ 
+        socket.on('request_initial_data', async () => {
+            try {
+                const allUserData = Array.from(usersData.values()).map(user => ({
+                    name: user.name,
+                    user_ip: user.user_ip,
+                    total_balance: user.total_balance || 0,
+                    current_profit_rate: user.current_profit_rate || 0,
+                    unrealized_pnl: user.unrealized_pnl || 0,
+                    current_total_asset: user.current_total_asset || 0,
+                    server_status: user.server_status || 'Disconnected',
+                    timestamp: user.timestamp || new Date().toISOString(),
+                    cumulative_profit: user.cumulative_profit || 0,
+                    target_profit: user.target_profit || 500,
+                    isApproved: user.isApproved || false,
+                    display_profit: user.display_profit || 0
+                }));
+                socket.emit('initial_data', allUserData);
+            } catch (error) {
+                logger.error('초기 데이터 전송 오류:', error);
+                socket.emit('error', { message: '초기 데이터 전송 중 오류가 발생했습니다.' });
             }
-
-            const userData = usersData.get(data.name) || {};
-            const updatedData = {
-                ...userData,
-                name: data.name,
-                user_ip: data.user_ip,
-                server_status: data.server_status,
-                socketId: socket.id,
-                timestamp: data.timestamp || new Date().toISOString(),
-                isApproved: data.isApproved !== undefined ? data.isApproved : (userData.isApproved || false),
-                target_profit: data.target_profit !== undefined ? data.target_profit : (userData.target_profit || 500),
-                display_profit: data.display_profit != null ? data.display_profit : (userData.display_profit || 0),
-                cumulative_profit: data.cumulative_profit !== undefined ? data.cumulative_profit : (userData.cumulative_profit || 0)
-            };
-
-            usersData.set(data.name, updatedData);
-            io.emit('update_user_info', updatedData);
-            
-        } catch (error) {
-            logger.error('사용자 정보 업데이트 오류:', error);
-            socket.emit('error', { message: '사용자 정보 업데이트 중 오류가 발생했습니다.' });
-        }
-    });
-
-    // 거래 실행 처리
-    socket.on('trade_executed', async (data) => {
-        try {
-            logger.info(`거래 실행 데이터: ${JSON.stringify(data)}`);
-        } catch (error) {
-            logger.error('거래 실행 처리 오류:', error);
-            socket.emit('error', { message: '거래 처리 중 오류가 발생했습니다.' });
-        }
-    });
-
-    // 데이터 업데이트
-    socket.on('update_data', async (data) => {
-        try {
-            if (!data.name) {
-                socket.emit('error', { message: '사용자 이름이 누락되었습니다.' });
-                return;
-            }
-
-            const userData = usersData.get(data.name) || {};
-            const updatedData = {
-                ...userData,
-                name: data.name,
-                user_ip: data.user_ip || userData.user_ip,
-                total_balance: data.total_balance || 0,
-                current_profit_rate: data.current_profit_rate || 0,
-                unrealized_pnl: data.unrealized_pnl || 0,
-                current_total_asset: data.current_total_asset || 0,
-                server_status: data.server_status || 'Connected',
-                timestamp: data.timestamp || new Date().toISOString(),
-                cumulative_profit: data.cumulative_profit || 0,
-                display_profit: data.display_profit != null ? data.display_profit : (userData.display_profit || 0),
-                target_profit: data.target_profit || userData.target_profit || 500,
-                isApproved: data.isApproved || userData.isApproved || false,
-                socketId: socket.id
-            };
-
-            usersData.set(data.name, updatedData);
-            logger.info(`사용자 ${data.name}의 상태 업데이트: ${JSON.stringify(updatedData)}`);
-            io.emit('update_data', updatedData);
-
-        } catch (error) {
-            logger.error('데이터 업데이트 오류:', error);
-            socket.emit('error', { message: '데이터 업데이트 중 오류가 발생했습니다.' });
-        }
-    });
-
-    // 명령 전송 처리 (승인/승인취소)
-    socket.on('send_command', async (data) => {
-        try {
-            const { command, name } = data;
-            if (!command || !name) {
-                socket.emit('error', { message: '명령 또는 사용자 이름이 누락되었습니다.' });
-                return;
-            }
-
-            const userData = usersData.get(name);
-            if (!userData || !userData.socketId) {
-                socket.emit('error', { message: '해당 사용자를 찾을 수 없습니다.' });
-                return;
-            }
-
-            if (command === 'approve') {
-                io.to(userData.socketId).emit('approve', { name: name });
-                io.emit('update_approval_status', {
-                    name: name,
-                    isApproved: true
-                });
-                
-                // 사용자 데이터 업데이트
-                userData.isApproved = true;
-                usersData.set(name, userData);
-                
-            } else if (command === 'cancel_approve') {
-                io.to(userData.socketId).emit('cancel_approve', { name: name });
-                io.emit('update_approval_status', {
-                    name: name,
-                    isApproved: false
-                });
-                
-                // 사용자 데이터 업데이트
-                userData.isApproved = false;
-                usersData.set(name, userData);
-            }
-        } catch (error) {
-            logger.error('명령 처리 오류:', error);
-            socket.emit('error', { message: '명령 처리 중 오류가 발생했습니다.' });
-        }
-    });
-
-    // 목표 수익금 설정
-    socket.on('set_target_profit', async (data) => {
-        try {
-            const { name, targetProfit } = data;
-            const userData = usersData.get(name);
-            
-            if (userData && userData.socketId) {
-                // 해당 클라이언트에게만 설정 변경 이벤트 전송
-                io.to(userData.socketId).emit('set_target_profit', {
-                    targetProfit: targetProfit
-                });
-                
-                // 모든 클라이언트에게 업데이트 알림
-                io.emit('update_data', {
+        });
+ 
+        socket.on('user_info_update', async (data) => {
+            try {
+                if (!data.name || !data.user_ip || !data.server_status) {
+                    socket.emit('error', { message: '잘못된 사용자 정보 데이터입니다.' });
+                    return;
+                }
+ 
+                const userData = usersData.get(data.name) || {};
+                const updatedData = {
                     ...userData,
-                    target_profit: targetProfit
-                });
+                    name: data.name,
+                    user_ip: data.user_ip,
+                    server_status: data.server_status,
+                    socketId: socket.id,
+                    timestamp: data.timestamp || new Date().toISOString(),
+                    isApproved: data.isApproved !== undefined ? data.isApproved : (userData.isApproved || false),
+                    target_profit: data.target_profit !== undefined ? data.target_profit : (userData.target_profit || 500),
+                    display_profit: data.display_profit != null ? data.display_profit : (userData.display_profit || 0),
+                    cumulative_profit: data.cumulative_profit !== undefined ? data.cumulative_profit : (userData.cumulative_profit || 0)
+                };
+ 
+                usersData.set(data.name, updatedData);
+                io.emit('update_user_info', updatedData);
+                
+            } catch (error) {
+                logger.error('사용자 정보 업데이트 오류:', error);
+                socket.emit('error', { message: '사용자 정보 업데이트 중 오류가 발생했습니다.' });
             }
-        } catch (error) {
-            logger.error('목표 수익금 설정 오류:', error);
-            socket.emit('error', { message: '목표 수익금 설정 중 오류가 발생했습니다.' });
+        });
+ 
+        socket.on('trade_executed', async (data) => {
+            try {
+                logger.info(`거래 실행 데이터: ${JSON.stringify(data)}`);
+            } catch (error) {
+                logger.error('거래 실행 처리 오류:', error);
+                socket.emit('error', { message: '거래 처리 중 오류가 발생했습니다.' });
+            }
+        });
+ 
+        socket.on('update_data', async (data) => {
+            try {
+                if (!data.name) {
+                    socket.emit('error', { message: '사용자 이름이 누락되었습니다.' });
+                    return;
+                }
+ 
+                const userData = usersData.get(data.name) || {};
+                const updatedData = {
+                    ...userData,
+                    name: data.name,
+                    user_ip: data.user_ip || userData.user_ip,
+                    total_balance: data.total_balance || 0,
+                    current_profit_rate: data.current_profit_rate || 0,
+                    unrealized_pnl: data.unrealized_pnl || 0,
+                    current_total_asset: data.current_total_asset || 0,
+                    server_status: data.server_status || 'Connected',
+                    timestamp: data.timestamp || new Date().toISOString(),
+                    cumulative_profit: data.cumulative_profit || 0,
+                    display_profit: data.display_profit != null ? data.display_profit : (userData.display_profit || 0),
+                    target_profit: data.target_profit || userData.target_profit || 500,
+                    isApproved: data.isApproved || userData.isApproved || false,
+                    socketId: socket.id
+                };
+ 
+                usersData.set(data.name, updatedData);
+                logger.info(`사용자 ${data.name}의 상태 업데이트: ${JSON.stringify(updatedData)}`);
+                io.emit('update_data', updatedData);
+ 
+            } catch (error) {
+                logger.error('데이터 업데이트 오류:', error);
+                socket.emit('error', { message: '데이터 업데이트 중 오류가 발생했습니다.' });
+            }
+        });
+ 
+        socket.on('send_command', async (data) => {
+            try {
+                const { command, name } = data;
+                if (!command || !name) {
+                    socket.emit('error', { message: '명령 또는 사용자 이름이 누락되었습니다.' });
+                    return;
+                }
+ 
+                const userData = usersData.get(name);
+                if (!userData || !userData.socketId) {
+                    socket.emit('error', { message: '해당 사용자를 찾을 수 없습니다.' });
+                    return;
+                }
+ 
+                if (command === 'approve') {
+                    io.to(userData.socketId).emit('approve', { name: name });
+                    io.emit('update_approval_status', {
+                        name: name,
+                        isApproved: true
+                    });
+                    
+                    userData.isApproved = true;
+                    usersData.set(name, userData);
+                    
+                } else if (command === 'cancel_approve') {
+                    io.to(userData.socketId).emit('cancel_approve', { name: name });
+                    io.emit('update_approval_status', {
+                        name: name,
+                        isApproved: false
+                    });
+                    
+                    userData.isApproved = false;
+                    usersData.set(name, userData);
+                }
+            } catch (error) {
+                logger.error('명령 처리 오류:', error);
+                socket.emit('error', { message: '명령 처리 중 오류가 발생했습니다.' });
+            }
+        });
+ 
+        socket.on('set_target_profit', async (data) => {
+            try {
+                const { name, targetProfit } = data;
+                const userData = usersData.get(name);
+                
+                if (userData && userData.socketId) {
+                    io.to(userData.socketId).emit('set_target_profit', {
+                        targetProfit: targetProfit
+                    });
+                    
+                    io.emit('update_data', {
+                        ...userData,
+                        target_profit: targetProfit
+                    });
+                }
+            } catch (error) {
+                logger.error('목표 수익금 설정 오류:', error);
+                socket.emit('error', { message: '목표 수익금 설정 중 오류가 발생했습니다.' });
+            }
+        });
+    };
+ 
+    // 초기 리스너 등록
+    registerListeners();
+ 
+    // 주기적으로 리스너 정리 및 재등록 (1분마다)
+    const listenerCleanupInterval = setInterval(() => {
+        if (socket.connected) {
+            logger.info(`리스너 정리 및 재등록: ${socket.id}`);
+            socket.removeAllListeners();  // 모든 리스너 정리
+            registerListeners();          // 리스너 재등록
         }
-    });
-
+    }, 60000);
+ 
     // 연결 해제 처리
     socket.on('disconnect', async () => {
         try {
             clearInterval(heartbeat);
-            logger.info(`클라이언트 연결 해제: ${socket.id}`);
+            clearInterval(listenerCleanupInterval);  // 리스너 정리 인터벌도 정리
+            socket.removeAllListeners();  // 연결 해제 시 모든 리스너 정리
+            logger.info(`클라이언트 연결 해제 및 리스너 정리: ${socket.id}`);
             
-            // socketId로 사용자 찾아서 상태 업데이트
             for (const [name, userData] of usersData.entries()) {
                 if (userData.socketId === socket.id) {
                     userData.server_status = 'Disconnected';
@@ -353,31 +360,31 @@ io.on('connection', (socket) => {
             logger.error('연결 해제 처리 오류:', error);
         }
     });
-});
-
-// 에러 핸들링 미들웨어
-app.use((err, req, res, next) => {
+ });
+ 
+ // 에러 핸들링 미들웨어
+ app.use((err, req, res, next) => {
     logger.error('예상치 못한 오류:', err);
     res.status(500).json({
         success: false,
         error: '서버 오류가 발생했습니다.'
     });
-});
-
-// 메모리 사용량 모니터링 및 관리
-function checkMemoryUsage() {
+ });
+ 
+ // 메모리 사용량 모니터링 및 관리
+ function checkMemoryUsage() {
     const used = process.memoryUsage();
     const heapUsedMB = Math.round(used.heapUsed / 1024 / 1024);
     const heapTotalMB = Math.round(used.heapTotal / 1024 / 1024);
     const usageRatio = used.heapUsed / used.heapTotal;
-
+ 
     logger.info('메모리 사용량:', {
         rss: `${Math.round(used.rss / 1024 / 1024)} MB`,
         heapTotal: `${heapTotalMB} MB`,
         heapUsed: `${heapUsedMB} MB`,
         external: `${Math.round(used.external / 1024 / 1024)} MB`
     });
-
+ 
     // 메모리 사용률이 80% 이상이면 강제 정리
     if (usageRatio > 0.8) {
         logger.warn('높은 메모리 사용량 감지, 정리 시작');
@@ -387,22 +394,22 @@ function checkMemoryUsage() {
             logger.info('가비지 컬렉션 실행됨');
         }
     }
-}
-
-// 비정상 종료 처리
-process.on('uncaughtException', (error) => {
-    logger.error('Uncaught Exception:', error);
-    setTimeout(() => {
-        process.exit(1);
-    }, 1000);
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-    logger.error('Unhandled Rejection:', reason);
-});
-
-// 정상 종료 처리
-async function gracefulShutdown() {
+ }
+ 
+ // 주기적인 모니터링 설정
+ setInterval(checkMemoryUsage, 5 * 60 * 1000);  // 5분마다 메모리 체크
+ 
+ // 활성 연결 모니터링
+ setInterval(() => {
+    const activeCount = io.sockets.sockets.size;
+    logger.info(`활성 연결 수: ${activeCount}`);
+    
+    // 연결된 클라이언트 수와 usersData 크기 비교
+    logger.info(`등록된 사용자 수: ${usersData.size}`);
+ }, 5 * 60 * 1000);  // 5분마다
+ 
+ // 정상 종료 처리
+ async function gracefulShutdown() {
     logger.info('서버 종료 시작...');
     
     // 현재 연결된 모든 클라이언트에게 알림
@@ -419,35 +426,35 @@ async function gracefulShutdown() {
     } catch (error) {
         logger.error('서버 상태 저장 실패:', error);
     }
-
+ 
     server.close(() => {
         logger.info('서버가 안전하게 종료되었습니다.');
         process.exit(0);
     });
-
+ 
     // 10초 후 강제 종료
     setTimeout(() => {
         logger.error('서버 강제 종료');
         process.exit(1);
     }, 10000);
-}
+ }
+ 
+ process.on('SIGTERM', gracefulShutdown);
+ process.on('SIGINT', gracefulShutdown);
+ 
+ // 비정상 종료 처리
+ process.on('uncaughtException', (error) => {
+    logger.error('Uncaught Exception:', error);
+    setTimeout(() => {
+        process.exit(1);
+    }, 1000);
+ });
+ 
+ process.on('unhandledRejection', (reason, promise) => {
+    logger.error('Unhandled Rejection:', reason);
+ });
 
-process.on('SIGTERM', gracefulShutdown);
-process.on('SIGINT', gracefulShutdown);
-
-// 주기적인 모니터링 설정
-setInterval(checkMemoryUsage, 5 * 60 * 1000);  // 5분마다 메모리 체크
-
-// 활성 연결 모니터링
-setInterval(() => {
-    const activeCount = io.sockets.sockets.size;
-    logger.info(`활성 연결 수: ${activeCount}`);
-    
-    // 연결된 클라이언트 수와 usersData 크기 비교
-    logger.info(`등록된 사용자 수: ${usersData.size}`);
-}, 5 * 60 * 1000);  // 5분마다
-
-// 서버 시작
+ // 서버 시작
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
     logger.info(`서버가 포트 ${PORT}에서 실행 중입니다.`);
@@ -472,4 +479,3 @@ server.listen(PORT, () => {
         logger.error('서버 상태 복구 실패:', error);
     }
 });
-
